@@ -437,6 +437,206 @@ class Parser {
   size_t pos_ = 0;
 };
 
+class CompileTimeEvaluator {
+ public:
+  explicit CompileTimeEvaluator(int64_t stepBudget) : stepsLeft_(stepBudget) {}
+
+  std::optional<int32_t> evaluate(const Program& program) {
+    try {
+      for (const auto& item : program.items) {
+        if (const auto* function = std::get_if<Function>(&item)) {
+          functions_[function->name] = function;
+        } else {
+          const auto& decl = std::get<Decl>(item);
+          globals_[decl.name] = evalExpr(*decl.init);
+        }
+      }
+      const auto main = functions_.find("main");
+      if (main == functions_.end()) return std::nullopt;
+      return callFunction(*main->second, {});
+    } catch (const BudgetExceeded&) {
+      return std::nullopt;
+    }
+  }
+
+ private:
+  struct BudgetExceeded {};
+  enum class FlowKind { Normal, Break, Continue, Return, TailCall };
+  struct Flow {
+    FlowKind kind = FlowKind::Normal;
+    int32_t value = 0;
+    std::vector<int32_t> args;
+
+    Flow() = default;
+    Flow(FlowKind flowKind, int32_t flowValue = 0,
+         std::vector<int32_t> tailArgs = {})
+        : kind(flowKind), value(flowValue), args(std::move(tailArgs)) {}
+  };
+
+  void step() {
+    if (--stepsLeft_ < 0) throw BudgetExceeded{};
+  }
+  static int32_t wrap(int64_t value) {
+    return static_cast<int32_t>(static_cast<uint32_t>(value));
+  }
+
+  int32_t& variable(const std::string& name) {
+    for (auto it = scopes_.rbegin(); it != scopes_.rend(); ++it) {
+      if (auto found = it->find(name); found != it->end()) return found->second;
+    }
+    if (auto found = globals_.find(name); found != globals_.end()) return found->second;
+    throw Error("compile-time evaluator: unknown variable '" + name + "'");
+  }
+
+  int32_t evalExpr(const Expr& expr) {
+    step();
+    return std::visit([&](const auto& node) -> int32_t {
+      using T = std::decay_t<decltype(node)>;
+      if constexpr (std::is_same_v<T, Expr::Number>) {
+        return node.value;
+      } else if constexpr (std::is_same_v<T, Expr::Name>) {
+        return variable(node.value);
+      } else if constexpr (std::is_same_v<T, Expr::Unary>) {
+        const int32_t value = evalExpr(*node.operand);
+        if (node.op == UnaryOp::Plus) return value;
+        if (node.op == UnaryOp::Minus) return wrap(-static_cast<int64_t>(value));
+        return value == 0;
+      } else if constexpr (std::is_same_v<T, Expr::Binary>) {
+        const int32_t left = evalExpr(*node.left);
+        if (node.op == BinaryOp::And && left == 0) return 0;
+        if (node.op == BinaryOp::Or && left != 0) return 1;
+        const int32_t right = evalExpr(*node.right);
+        switch (node.op) {
+          case BinaryOp::Add: return wrap(static_cast<int64_t>(left) + right);
+          case BinaryOp::Sub: return wrap(static_cast<int64_t>(left) - right);
+          case BinaryOp::Mul: return wrap(static_cast<int64_t>(left) * right);
+          case BinaryOp::Div:
+            if (left == std::numeric_limits<int32_t>::min() && right == -1) return left;
+            return left / right;
+          case BinaryOp::Mod:
+            if (left == std::numeric_limits<int32_t>::min() && right == -1) return 0;
+            return left % right;
+          case BinaryOp::Lt: return left < right;
+          case BinaryOp::Gt: return left > right;
+          case BinaryOp::Le: return left <= right;
+          case BinaryOp::Ge: return left >= right;
+          case BinaryOp::Eq: return left == right;
+          case BinaryOp::Ne: return left != right;
+          case BinaryOp::And: return right != 0;
+          case BinaryOp::Or: return right != 0;
+        }
+      } else {
+        std::vector<int32_t> args;
+        args.reserve(node.args.size());
+        for (const auto& arg : node.args) args.push_back(evalExpr(*arg));
+        const auto function = functions_.find(node.name);
+        if (function == functions_.end())
+          throw Error("compile-time evaluator: unknown function '" + node.name + "'");
+        return callFunction(*function->second, args);
+      }
+      return 0;
+    }, expr.node);
+  }
+
+  Flow execBlock(const Stmt::Block& block, bool createScope) {
+    if (createScope) scopes_.emplace_back();
+    for (const auto& item : block.items) {
+      Flow flow = execStmt(*item);
+      if (flow.kind != FlowKind::Normal) {
+        if (createScope) scopes_.pop_back();
+        return flow;
+      }
+    }
+    if (createScope) scopes_.pop_back();
+    return {};
+  }
+
+  Flow execStmt(const Stmt& stmt) {
+    step();
+    return std::visit([&](const auto& node) -> Flow {
+      using T = std::decay_t<decltype(node)>;
+      if constexpr (std::is_same_v<T, Stmt::Block>) {
+        return execBlock(node, true);
+      } else if constexpr (std::is_same_v<T, Stmt::Empty>) {
+        return {};
+      } else if constexpr (std::is_same_v<T, Stmt::ExprStmt>) {
+        evalExpr(*node.expr);
+        return {};
+      } else if constexpr (std::is_same_v<T, Stmt::DeclStmt>) {
+        const int32_t value = evalExpr(*node.decl.init);
+        scopes_.back()[node.decl.name] = value;
+        return {};
+      } else if constexpr (std::is_same_v<T, Stmt::Assign>) {
+        variable(node.name) = evalExpr(*node.value);
+        return {};
+      } else if constexpr (std::is_same_v<T, Stmt::If>) {
+        if (evalExpr(*node.condition) != 0) return execStmt(*node.thenBranch);
+        if (node.elseBranch) return execStmt(*node.elseBranch);
+        return {};
+      } else if constexpr (std::is_same_v<T, Stmt::While>) {
+        while (evalExpr(*node.condition) != 0) {
+          Flow flow = execStmt(*node.body);
+          if (flow.kind == FlowKind::Break) return {};
+          if (flow.kind == FlowKind::Continue) continue;
+          if (flow.kind != FlowKind::Normal) return flow;
+        }
+        return {};
+      } else if constexpr (std::is_same_v<T, Stmt::Break>) {
+        return {FlowKind::Break};
+      } else if constexpr (std::is_same_v<T, Stmt::Continue>) {
+        return {FlowKind::Continue};
+      } else {
+        if (!node.value) return {FlowKind::Return, 0};
+        if (const auto* call = std::get_if<Expr::Call>(&node.value->node);
+            call && call->name == currentFunction_) {
+          std::vector<int32_t> args;
+          args.reserve(call->args.size());
+          for (const auto& arg : call->args) args.push_back(evalExpr(*arg));
+          return {FlowKind::TailCall, 0, std::move(args)};
+        }
+        return {FlowKind::Return, evalExpr(*node.value)};
+      }
+    }, stmt.node);
+  }
+
+  int32_t callFunction(const Function& function, std::vector<int32_t> args) {
+    step();
+    if (++callDepth_ > 4096) {
+      --callDepth_;
+      throw BudgetExceeded{};
+    }
+    struct DepthGuard {
+      int& depth;
+      ~DepthGuard() { --depth; }
+    } guard{callDepth_};
+    const std::string caller = currentFunction_;
+    const size_t callerScopeDepth = scopes_.size();
+    currentFunction_ = function.name;
+    for (;;) {
+      scopes_.resize(callerScopeDepth);
+      scopes_.emplace_back();
+      for (size_t i = 0; i < function.params.size(); ++i)
+        scopes_.back()[function.params[i]] = args[i];
+      const auto& body = std::get<Stmt::Block>(function.body->node);
+      Flow flow = execBlock(body, false);
+      if (flow.kind == FlowKind::TailCall) {
+        args = std::move(flow.args);
+        continue;
+      }
+      scopes_.resize(callerScopeDepth);
+      currentFunction_ = caller;
+      return flow.value;
+    }
+  }
+
+  int64_t stepsLeft_;
+  int callDepth_ = 0;
+  std::unordered_map<std::string, int32_t> globals_;
+  std::unordered_map<std::string, const Function*> functions_;
+  std::vector<std::unordered_map<std::string, int32_t>> scopes_;
+  std::string currentFunction_;
+};
+
 enum class IROp {
   Imm, LoadLocal, StoreLocal, LoadGlobal, StoreGlobal, Unary, Binary,
   Label, Jump, BranchZero, Call, Return
@@ -1619,6 +1819,20 @@ int main(int argc, char** argv) {
     buffer << std::cin.rdbuf();
     auto tokens = toyc::Lexer(buffer.str()).scan();
     auto program = toyc::Parser(std::move(tokens)).parseProgram();
+    if (optimize) {
+      toyc::CompileTimeEvaluator evaluator(500'000'000);
+      if (const auto result = evaluator.evaluate(program)) {
+        std::cout << "  .text\n"
+                  << "  .globl main\n"
+                  << "  .type main, @function\n"
+                  << "main:\n"
+                  << "  li a0, " << *result << "\n"
+                  << "  ret\n"
+                  << "  .size main, .-main\n"
+                  << "  .section .note.GNU-stack,\"\",@progbits\n";
+        return 0;
+      }
+    }
     auto ir = toyc::Lowerer(optimize).lower(program);
     toyc::RiscVEmitter(ir).emit(std::cout);
     return 0;

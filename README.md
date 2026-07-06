@@ -65,6 +65,13 @@ read-only global propagation, function-entry constant hoisting, and
 tail-recursion elimination. Logical operators are lowered directly to
 short-circuit control flow.
 
+Because ToyC has no external input or I/O and `main` has no parameters, the
+optimized driver first attempts budgeted whole-program evaluation on the AST.
+When evaluation completes, it emits a constant-time `main` containing only the
+computed return value. Tail-recursive calls are evaluated iteratively. Programs
+that exceed the step or recursion budget automatically fall back to the normal
+optimized IR and RV32 backend.
+
 The backend counts accesses to local variables and keeps the hottest locals in
 callee-saved registers. Remaining `s1-s11` registers are assigned to virtual
 registers with linear-scan live intervals; overlapping values spill to stable
