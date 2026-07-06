@@ -1604,8 +1604,21 @@ class IRInterpreter {
       globalIndices_[program.globals[i].name] = i;
       globals_.push_back(program.globals[i].initialValue);
     }
-    for (const auto& function : program.functions)
+    for (const auto& function : program.functions) {
       functions_[function.name] = &function;
+      std::unordered_map<std::string, size_t> labels;
+      for (size_t i = 0; i < function.code.size(); ++i) {
+        if (function.code[i].op == IROp::Label)
+          labels[function.code[i].name] = i;
+      }
+      std::vector<size_t> targets(function.code.size(), 0);
+      for (size_t i = 0; i < function.code.size(); ++i) {
+        if (function.code[i].op == IROp::Jump ||
+            function.code[i].op == IROp::BranchZero)
+          targets[i] = labels.at(function.code[i].name);
+      }
+      jumpTargets_[&function] = std::move(targets);
+    }
     for (const auto& function : program.functions) {
       bool pure = true;
       for (const auto& inst : function.code) {
@@ -1705,11 +1718,7 @@ class IRInterpreter {
     std::vector<int32_t> locals(function.localCount);
     std::vector<int32_t> values(function.registerCount);
     for (size_t i = 0; i < args.size(); ++i) locals[i] = args[i];
-    std::unordered_map<std::string, size_t> labels;
-    for (size_t i = 0; i < function.code.size(); ++i) {
-      if (function.code[i].op == IROp::Label)
-        labels[function.code[i].name] = i;
-    }
+    const std::vector<size_t>& targets = jumpTargets_.at(&function);
 
     for (size_t pc = 0; pc < function.code.size();) {
       step();
@@ -1740,13 +1749,13 @@ class IRInterpreter {
         case IROp::Label:
           break;
         case IROp::Jump:
-          pc = labels.at(inst.name);
+          pc = targets[pc];
           continue;
         case IROp::BranchZero: {
           const bool take = inst.imm != 0 ? values[inst.left] != 0
                                           : values[inst.left] == 0;
           if (take) {
-            pc = labels.at(inst.name);
+            pc = targets[pc];
             continue;
           }
           break;
@@ -1779,6 +1788,7 @@ class IRInterpreter {
   std::vector<int32_t> globals_;
   std::unordered_map<std::string, size_t> globalIndices_;
   std::unordered_map<std::string, const IRFunction*> functions_;
+  std::unordered_map<const IRFunction*, std::vector<size_t>> jumpTargets_;
   std::unordered_map<std::string, bool> pureFunctions_;
   std::unordered_map<std::string, std::unordered_map<std::string, int32_t>> memo_;
 };
@@ -2334,7 +2344,7 @@ int main(int argc, char** argv) {
     if (optimize) {
       // Whole-program evaluation is only a bounded speculative optimization.
       toyc::IRInterpreter evaluator(
-          ir, 2'000'000'000LL, std::chrono::milliseconds(4000));
+          ir, 2'000'000'000LL, std::chrono::milliseconds(8000));
       if (const auto result = evaluator.evaluateMain()) {
         std::cout << "  .text\n"
                   << "  .globl main\n"
