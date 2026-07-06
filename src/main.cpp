@@ -945,13 +945,124 @@ class RiscVEmitter {
   }
 
  private:
+  struct Allocation {
+    std::vector<int> localRegisters;
+    std::vector<int> valueRegisters;
+    std::vector<int> spillSlots;
+    int savedRegisterCount = 0;
+    int spillCount = 0;
+  };
+
   static int align16(int value) { return (value + 15) & ~15; }
   static bool fitsImmediate12(int value) { return value >= -2048 && value <= 2047; }
   void line(const std::string& text) { *out_ << text << '\n'; }
 
-  int slotOffset(int index) const { return -12 - index * 4; }
-  int regSlot(const IRFunction& function, int reg) const {
-    return function.localCount + reg;
+  static std::string savedRegister(int index) {
+    return "s" + std::to_string(index + 1);
+  }
+
+  static void markUse(std::vector<int>& first, std::vector<int>& last,
+                      int reg, int position) {
+    if (reg < 0) return;
+    first[reg] = std::min(first[reg], position);
+    last[reg] = std::max(last[reg], position);
+  }
+
+  Allocation allocateRegisters(const IRFunction& function) const {
+    Allocation allocation;
+    allocation.localRegisters.assign(function.localCount, -1);
+    allocation.valueRegisters.assign(function.registerCount, -1);
+    allocation.spillSlots.assign(function.registerCount, -1);
+
+    std::vector<int> localAccesses(function.localCount, 0);
+    for (const auto& inst : function.code) {
+      if ((inst.op == IROp::LoadLocal || inst.op == IROp::StoreLocal) &&
+          inst.left >= 0) {
+        ++localAccesses[inst.left];
+      }
+    }
+    std::vector<int> locals(function.localCount);
+    for (int i = 0; i < function.localCount; ++i) locals[i] = i;
+    std::stable_sort(locals.begin(), locals.end(), [&](int left, int right) {
+      return localAccesses[left] > localAccesses[right];
+    });
+    const int localRegisterCount = std::min(5, function.localCount);
+    for (int i = 0; i < localRegisterCount; ++i)
+      allocation.localRegisters[locals[i]] = i;
+
+    const int infinity = std::numeric_limits<int>::max();
+    std::vector<int> first(function.registerCount, infinity);
+    std::vector<int> last(function.registerCount, -1);
+    for (size_t i = 0; i < function.code.size(); ++i) {
+      const auto& inst = function.code[i];
+      const int position = static_cast<int>(i);
+      if (inst.dst >= 0) markUse(first, last, inst.dst, position);
+      switch (inst.op) {
+        case IROp::StoreLocal:
+        case IROp::StoreGlobal:
+          markUse(first, last, inst.right, position);
+          break;
+        case IROp::Unary:
+        case IROp::BranchZero:
+        case IROp::Return:
+          markUse(first, last, inst.left, position);
+          break;
+        case IROp::Binary:
+          markUse(first, last, inst.left, position);
+          markUse(first, last, inst.right, position);
+          break;
+        case IROp::Call:
+          for (int arg : inst.args) markUse(first, last, arg, position);
+          break;
+        default:
+          break;
+      }
+    }
+
+    std::vector<int> values;
+    for (int reg = 0; reg < function.registerCount; ++reg) {
+      if (first[reg] != infinity) values.push_back(reg);
+    }
+    std::stable_sort(values.begin(), values.end(), [&](int left, int right) {
+      return first[left] < first[right];
+    });
+
+    struct Active { int value; int physical; };
+    std::vector<Active> active;
+    std::vector<bool> used(11, false);
+    for (int i = 0; i < localRegisterCount; ++i) used[i] = true;
+    for (int value : values) {
+      for (auto it = active.begin(); it != active.end();) {
+        if (last[it->value] < first[value]) {
+          used[it->physical] = false;
+          it = active.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      int physical = -1;
+      for (int candidate = localRegisterCount; candidate < 11; ++candidate) {
+        if (!used[candidate]) {
+          physical = candidate;
+          break;
+        }
+      }
+      if (physical >= 0) {
+        allocation.valueRegisters[value] = physical;
+        used[physical] = true;
+        active.push_back({value, physical});
+      } else {
+        allocation.spillSlots[value] = allocation.spillCount++;
+      }
+    }
+    allocation.savedRegisterCount = localRegisterCount;
+    for (int physical : allocation.valueRegisters)
+      allocation.savedRegisterCount = std::max(allocation.savedRegisterCount, physical + 1);
+    return allocation;
+  }
+
+  int slotOffset(int index) const {
+    return -12 - allocation_->savedRegisterCount * 4 - index * 4;
   }
   void addressFrom(const std::string& dst, const std::string& base, int offset) {
     line("  li " + dst + ", " + std::to_string(offset));
@@ -974,22 +1085,51 @@ class RiscVEmitter {
     }
   }
   void loadReg(const IRFunction& function, int reg, const std::string& dst) {
-    loadAt(dst, "s0", slotOffset(regSlot(function, reg)));
+    const int physical = allocation_->valueRegisters[reg];
+    if (physical >= 0) {
+      const std::string source = savedRegister(physical);
+      if (source != dst) line("  mv " + dst + ", " + source);
+      return;
+    }
+    const int slot = function.localCount + allocation_->spillSlots[reg];
+    loadAt(dst, "s0", slotOffset(slot));
   }
   void storeReg(const IRFunction& function, int reg, const std::string& src) {
-    storeAt(src, "s0", slotOffset(regSlot(function, reg)));
+    const int physical = allocation_->valueRegisters[reg];
+    if (physical >= 0) {
+      const std::string destination = savedRegister(physical);
+      if (destination != src) line("  mv " + destination + ", " + src);
+      return;
+    }
+    const int slot = function.localCount + allocation_->spillSlots[reg];
+    storeAt(src, "s0", slotOffset(slot));
   }
   void loadLocal(int slot, const std::string& dst) {
+    const int physical = allocation_->localRegisters[slot];
+    if (physical >= 0) {
+      const std::string source = savedRegister(physical);
+      if (source != dst) line("  mv " + dst + ", " + source);
+      return;
+    }
     loadAt(dst, "s0", slotOffset(slot));
   }
   void storeLocal(int slot, const std::string& src) {
+    const int physical = allocation_->localRegisters[slot];
+    if (physical >= 0) {
+      const std::string destination = savedRegister(physical);
+      if (destination != src) line("  mv " + destination + ", " + src);
+      return;
+    }
     storeAt(src, "s0", slotOffset(slot));
   }
 
   void emitFunction(const IRFunction& function) {
-    const int valueSlots = function.localCount + function.registerCount;
+    const Allocation allocation = allocateRegisters(function);
+    allocation_ = &allocation;
+    const int valueSlots = function.localCount + allocation.spillCount;
     const int outgoingBytes = std::max(0, function.maxCallArgs - 8) * 4;
-    const int frameSize = align16(8 + valueSlots * 4 + outgoingBytes);
+    const int savedBytes = allocation.savedRegisterCount * 4;
+    const int frameSize = align16(8 + savedBytes + valueSlots * 4 + outgoingBytes);
     const std::string epilogue = ".L" + function.name + "_return";
 
     line("");
@@ -1001,6 +1141,9 @@ class RiscVEmitter {
       line("  sw ra, " + std::to_string(frameSize - 4) + "(sp)");
       line("  sw s0, " + std::to_string(frameSize - 8) + "(sp)");
       line("  addi s0, sp, " + std::to_string(frameSize));
+      for (int i = 0; i < allocation.savedRegisterCount; ++i)
+        line("  sw " + savedRegister(i) + ", " +
+             std::to_string(frameSize - 12 - i * 4) + "(sp)");
     } else {
       line("  li t0, " + std::to_string(frameSize));
       line("  sub sp, sp, t0");
@@ -1008,6 +1151,9 @@ class RiscVEmitter {
       line("  sw ra, -4(t6)");
       line("  sw s0, -8(t6)");
       line("  mv s0, t6");
+      for (int i = 0; i < allocation.savedRegisterCount; ++i)
+        line("  sw " + savedRegister(i) + ", " +
+             std::to_string(-12 - i * 4) + "(s0)");
     }
     for (size_t i = 0; i < function.params.size(); ++i) {
       if (i < 8) {
@@ -1072,12 +1218,15 @@ class RiscVEmitter {
       }
     }
     line(epilogue + ":");
+    for (int i = 0; i < allocation.savedRegisterCount; ++i)
+      loadAt(savedRegister(i), "s0", -12 - i * 4);
     line("  lw ra, -4(s0)");
     line("  lw t0, -8(s0)");
     line("  mv sp, s0");
     line("  mv s0, t0");
     line("  ret");
     line("  .size " + function.name + ", .-" + function.name);
+    allocation_ = nullptr;
   }
 
   void emitBinary(const IRFunction& function, const IRInst& inst) {
@@ -1129,6 +1278,7 @@ class RiscVEmitter {
 
   const IRProgram& program_;
   std::ostream* out_ = nullptr;
+  const Allocation* allocation_ = nullptr;
 };
 
 }  // namespace toyc

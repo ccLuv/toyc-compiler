@@ -59,7 +59,12 @@ the exit code with the corresponding `.expected` file.
 ## Current optimization strategy
 
 Named constants and constant initializers are evaluated during lowering.
-Logical operators are lowered directly to short-circuit control flow. The
-backend prioritizes correctness by assigning stable stack locations to IR
-values; this is intentionally a suitable baseline for later register
-allocation and data-flow passes.
+With `-opt`, the IR performs basic-block-local constant propagation and
+constant folding. Logical operators are lowered directly to short-circuit
+control flow.
+
+The backend counts accesses to local variables and keeps the hottest locals in
+callee-saved registers. Remaining `s1-s11` registers are assigned to virtual
+registers with linear-scan live intervals; overlapping values spill to stable
+stack slots. Every function saves and restores the callee-saved registers it
+uses. Direct 12-bit stack offsets are emitted whenever possible.
