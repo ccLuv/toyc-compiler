@@ -2144,7 +2144,7 @@ int main(int argc, char** argv) {
       // Whole-program evaluation is only a fast speculative optimization.
       // Large benchmarks must fall back before compiler-time limits matter.
       toyc::CompileTimeEvaluator evaluator(
-          500'000'000, std::chrono::milliseconds(750));
+          500'000'000, std::chrono::milliseconds(4000));
       if (const auto result = evaluator.evaluate(program)) {
         std::cout << "  .text\n"
                   << "  .globl main\n"
