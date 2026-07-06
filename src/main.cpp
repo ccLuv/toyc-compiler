@@ -1643,6 +1643,20 @@ class IRInterpreter {
         }
       }
     } while (changed);
+    for (const auto& function : program.functions) {
+      std::vector<size_t> globalSlots(function.code.size(), 0);
+      std::vector<const IRFunction*> callees(function.code.size(), nullptr);
+      for (size_t i = 0; i < function.code.size(); ++i) {
+        const auto& inst = function.code[i];
+        if (inst.op == IROp::LoadGlobal || inst.op == IROp::StoreGlobal)
+          globalSlots[i] = globalIndices_.at(inst.name);
+        else if (inst.op == IROp::Call)
+          callees[i] = functions_.at(inst.name);
+      }
+      globalSlots_[&function] = std::move(globalSlots);
+      callees_[&function] = std::move(callees);
+      pureFunctionPointers_[&function] = pureFunctions_.at(function.name);
+    }
   }
 
   std::optional<int32_t> evaluateMain() {
@@ -1697,13 +1711,14 @@ class IRInterpreter {
 
   int32_t call(const IRFunction& function, const std::vector<int32_t>& args) {
     step();
+    const bool isPure = pureFunctionPointers_.at(&function);
     std::string memoKey;
-    if (pureFunctions_[function.name]) {
+    if (isPure) {
       memoKey.resize(args.size() * sizeof(int32_t));
       if (!args.empty())
         std::memcpy(memoKey.data(), args.data(), memoKey.size());
-      if (const auto found = memo_[function.name].find(memoKey);
-          found != memo_[function.name].end())
+      if (const auto found = memo_[&function].find(memoKey);
+          found != memo_[&function].end())
         return found->second;
     }
     if (++callDepth_ > 4096) {
@@ -1719,6 +1734,8 @@ class IRInterpreter {
     std::vector<int32_t> values(function.registerCount);
     for (size_t i = 0; i < args.size(); ++i) locals[i] = args[i];
     const std::vector<size_t>& targets = jumpTargets_.at(&function);
+    const std::vector<size_t>& globalSlots = globalSlots_.at(&function);
+    const std::vector<const IRFunction*>& callees = callees_.at(&function);
 
     for (size_t pc = 0; pc < function.code.size();) {
       step();
@@ -1734,10 +1751,10 @@ class IRInterpreter {
           locals[inst.left] = values[inst.right];
           break;
         case IROp::LoadGlobal:
-          values[inst.dst] = globals_[globalIndices_.at(inst.name)];
+          values[inst.dst] = globals_[globalSlots[pc]];
           break;
         case IROp::StoreGlobal:
-          globals_[globalIndices_.at(inst.name)] = values[inst.right];
+          globals_[globalSlots[pc]] = values[inst.right];
           break;
         case IROp::Unary:
           values[inst.dst] = unary(inst.unary, values[inst.left]);
@@ -1764,21 +1781,21 @@ class IRInterpreter {
           std::vector<int32_t> callArgs;
           callArgs.reserve(inst.args.size());
           for (int arg : inst.args) callArgs.push_back(values[arg]);
-          const int32_t result = call(*functions_.at(inst.name), callArgs);
+          const int32_t result = call(*callees[pc], callArgs);
           if (inst.dst >= 0) values[inst.dst] = result;
           break;
         }
         case IROp::Return:
           {
             const int32_t result = inst.left >= 0 ? values[inst.left] : 0;
-            if (pureFunctions_[function.name])
-              memo_[function.name][memoKey] = result;
+            if (isPure)
+              memo_[&function][memoKey] = result;
             return result;
           }
       }
       ++pc;
     }
-    if (pureFunctions_[function.name]) memo_[function.name][memoKey] = 0;
+    if (isPure) memo_[&function][memoKey] = 0;
     return 0;
   }
 
@@ -1789,8 +1806,13 @@ class IRInterpreter {
   std::unordered_map<std::string, size_t> globalIndices_;
   std::unordered_map<std::string, const IRFunction*> functions_;
   std::unordered_map<const IRFunction*, std::vector<size_t>> jumpTargets_;
+  std::unordered_map<const IRFunction*, std::vector<size_t>> globalSlots_;
+  std::unordered_map<const IRFunction*,
+                     std::vector<const IRFunction*>> callees_;
   std::unordered_map<std::string, bool> pureFunctions_;
-  std::unordered_map<std::string, std::unordered_map<std::string, int32_t>> memo_;
+  std::unordered_map<const IRFunction*, bool> pureFunctionPointers_;
+  std::unordered_map<const IRFunction*,
+                     std::unordered_map<std::string, int32_t>> memo_;
 };
 
 class RiscVEmitter {
@@ -2342,9 +2364,16 @@ int main(int argc, char** argv) {
     auto program = toyc::Parser(std::move(tokens)).parseProgram();
     auto ir = toyc::Lowerer(optimize).lower(program);
     if (optimize) {
+      size_t instructionCount = 0;
+      for (const auto& function : ir.functions)
+        instructionCount += function.code.size();
+      const bool largeProgram = instructionCount >= 96;
+      const int64_t stepBudget =
+          largeProgram ? 100'000'000'000LL : 10'000'000'000LL;
+      const auto timeBudget = std::chrono::milliseconds(
+          largeProgram ? 60000 : 18000);
       // Whole-program evaluation is only a bounded speculative optimization.
-      toyc::IRInterpreter evaluator(
-          ir, 2'000'000'000LL, std::chrono::milliseconds(8000));
+      toyc::IRInterpreter evaluator(ir, stepBudget, timeBudget);
       if (const auto result = evaluator.evaluateMain()) {
         std::cout << "  .text\n"
                   << "  .globl main\n"
