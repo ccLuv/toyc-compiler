@@ -60,11 +60,16 @@ the exit code with the corresponding `.expected` file.
 
 Named constants and constant initializers are evaluated during lowering.
 With `-opt`, the IR performs basic-block-local constant propagation and
-constant folding. Logical operators are lowered directly to short-circuit
-control flow.
+constant folding, algebraic simplification, dead value/store elimination,
+read-only global propagation, function-entry constant hoisting, and
+tail-recursion elimination. Logical operators are lowered directly to
+short-circuit control flow.
 
 The backend counts accesses to local variables and keeps the hottest locals in
 callee-saved registers. Remaining `s1-s11` registers are assigned to virtual
 registers with linear-scan live intervals; overlapping values spill to stable
-stack slots. Every function saves and restores the callee-saved registers it
-uses. Direct 12-bit stack offsets are emitted whenever possible.
+stack slots. Live intervals are extended across loop back-edges to preserve
+loop-invariant values. The instruction selector directly consumes allocated
+registers instead of routing every operation through temporary registers.
+Every function saves and restores the callee-saved registers it uses. Direct
+12-bit stack offsets are emitted whenever possible.

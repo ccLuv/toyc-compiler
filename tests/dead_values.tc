@@ -1,0 +1,6 @@
+int main() {
+  int unused = 10;
+  unused = unused * 20 + 30;
+  unused = unused * unused;
+  return 7;
+}

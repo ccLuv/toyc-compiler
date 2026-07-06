@@ -1,0 +1,9 @@
+int factor = 17;
+
+int calculate(int x) {
+  return x * factor + factor;
+}
+
+int main() {
+  return calculate(10);
+}
