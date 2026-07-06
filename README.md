@@ -65,6 +65,10 @@ read-only global propagation, function-entry constant hoisting, and
 tail-recursion elimination. Logical operators are lowered directly to
 short-circuit control flow.
 
+Dead stores are identified with iterative CFG local-variable liveness plus a
+backward dependency slice from observable results. Basic-block copy propagation
+and common-subexpression elimination remove redundant value chains.
+
 Because ToyC has no external input or I/O and `main` has no parameters, the
 optimized driver first attempts budgeted whole-program evaluation on the AST.
 When evaluation completes, it emits a constant-time `main` containing only the
@@ -78,5 +82,8 @@ registers with linear-scan live intervals; overlapping values spill to stable
 stack slots. Live intervals are extended across loop back-edges to preserve
 loop-invariant values. The instruction selector directly consumes allocated
 registers instead of routing every operation through temporary registers.
+Comparison-plus-branch and expression-plus-local-store patterns are fused, so
+typical counting loops use a direct conditional branch, one update, and one
+back-edge jump.
 Every function saves and restores the callee-saved registers it uses. Direct
 12-bit stack offsets are emitted whenever possible.

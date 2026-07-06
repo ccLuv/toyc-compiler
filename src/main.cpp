@@ -808,6 +808,7 @@ class Lowerer {
       optimizeTailRecursion();
       optimizeCurrentFunction();
       hoistAndDeduplicateConstants();
+      eliminateCopiesAndCommonExpressions();
       eliminateDeadCode();
     }
     current_.registerCount = nextReg_;
@@ -975,6 +976,7 @@ class Lowerer {
         snapshot.dst = copy;
         snapshot.left = arg;
         snapshot.unary = UnaryOp::Plus;
+        snapshot.name = "snapshot";
         rewritten.push_back(std::move(snapshot));
         snapshots.push_back(copy);
       }
@@ -1058,28 +1060,177 @@ class Lowerer {
            inst.op == IROp::Binary;
   }
 
+  void eliminateCopiesAndCommonExpressions() {
+    std::vector<int> aliases(nextReg_, -1);
+    std::vector<int> localValues(current_.localCount, -1);
+    std::unordered_map<std::string, int> expressions;
+    std::vector<bool> removed(current_.code.size(), false);
+
+    auto resolve = [&](int reg) {
+      int current = reg;
+      while (current >= 0 && aliases[current] >= 0) current = aliases[current];
+      return current;
+    };
+    auto rewriteUses = [&](IRInst& inst) {
+      switch (inst.op) {
+        case IROp::StoreLocal:
+        case IROp::StoreGlobal:
+          inst.right = resolve(inst.right);
+          break;
+        case IROp::Unary:
+        case IROp::BranchZero:
+        case IROp::Return:
+          inst.left = resolve(inst.left);
+          break;
+        case IROp::Binary:
+          inst.left = resolve(inst.left);
+          inst.right = resolve(inst.right);
+          break;
+        case IROp::Call:
+          for (int& arg : inst.args) arg = resolve(arg);
+          break;
+        default:
+          break;
+      }
+    };
+
+    for (size_t i = 0; i < current_.code.size(); ++i) {
+      IRInst& inst = current_.code[i];
+      rewriteUses(inst);
+      if (inst.op == IROp::Label || inst.op == IROp::Jump ||
+          inst.op == IROp::BranchZero || inst.op == IROp::Call) {
+        std::fill(localValues.begin(), localValues.end(), -1);
+        expressions.clear();
+      }
+      if (inst.op == IROp::LoadLocal) {
+        if (localValues[inst.left] >= 0) {
+          aliases[inst.dst] = resolve(localValues[inst.left]);
+          removed[i] = true;
+        } else {
+          localValues[inst.left] = inst.dst;
+        }
+      } else if (inst.op == IROp::StoreLocal) {
+        localValues[inst.left] = resolve(inst.right);
+        expressions.clear();
+      } else if (inst.op == IROp::Unary && inst.unary == UnaryOp::Plus &&
+                 inst.name.empty()) {
+        aliases[inst.dst] = resolve(inst.left);
+        removed[i] = true;
+      } else if (inst.op == IROp::Binary) {
+        int left = resolve(inst.left);
+        int right = resolve(inst.right);
+        const bool commutative =
+            inst.binary == BinaryOp::Add || inst.binary == BinaryOp::Mul ||
+            inst.binary == BinaryOp::Eq || inst.binary == BinaryOp::Ne;
+        if (commutative && left > right) std::swap(left, right);
+        const std::string key = std::to_string(static_cast<int>(inst.binary)) +
+                                ":" + std::to_string(left) +
+                                ":" + std::to_string(right);
+        if (const auto found = expressions.find(key); found != expressions.end()) {
+          aliases[inst.dst] = resolve(found->second);
+          removed[i] = true;
+        } else {
+          expressions[key] = inst.dst;
+        }
+      }
+    }
+
+    std::vector<IRInst> kept;
+    kept.reserve(current_.code.size());
+    for (size_t i = 0; i < current_.code.size(); ++i) {
+      if (removed[i]) continue;
+      rewriteUses(current_.code[i]);
+      kept.push_back(std::move(current_.code[i]));
+    }
+    current_.code = std::move(kept);
+  }
+
   void eliminateDeadCode() {
     bool changed;
     do {
       changed = false;
       std::vector<bool> used(nextReg_, false);
       std::vector<bool> deadStores(current_.code.size(), false);
-      std::vector<bool> liveLocals(current_.localCount, false);
-      for (size_t reverse = current_.code.size(); reverse > 0; --reverse) {
-        const size_t index = reverse - 1;
-        const auto& inst = current_.code[index];
-        if (inst.op == IROp::Label || inst.op == IROp::Jump ||
-            inst.op == IROp::BranchZero) {
-          std::fill(liveLocals.begin(), liveLocals.end(), true);
-        } else if (inst.op == IROp::LoadLocal) {
-          liveLocals[inst.left] = true;
-        } else if (inst.op == IROp::StoreLocal) {
-          if (!liveLocals[inst.left]) {
-            deadStores[index] = true;
-          } else {
-            liveLocals[inst.left] = false;
+      std::vector<bool> essentialRegs(nextReg_, false);
+      std::vector<bool> essentialLocals(current_.localCount, false);
+      auto markEssentialReg = [&](int reg) {
+        if (reg < 0 || essentialRegs[reg]) return false;
+        essentialRegs[reg] = true;
+        return true;
+      };
+      for (const auto& inst : current_.code) {
+        if (inst.op == IROp::BranchZero || inst.op == IROp::Return)
+          markEssentialReg(inst.left);
+        if (inst.op == IROp::StoreGlobal) markEssentialReg(inst.right);
+        if (inst.op == IROp::Call) {
+          for (int arg : inst.args) markEssentialReg(arg);
+        }
+      }
+      bool dependencyChanged;
+      do {
+        dependencyChanged = false;
+        for (const auto& inst : current_.code) {
+          if (inst.op == IROp::LoadLocal && essentialRegs[inst.dst] &&
+              !essentialLocals[inst.left]) {
+            essentialLocals[inst.left] = true;
+            dependencyChanged = true;
+          } else if (inst.op == IROp::StoreLocal &&
+                     essentialLocals[inst.left]) {
+            dependencyChanged |= markEssentialReg(inst.right);
+          } else if (inst.op == IROp::Unary && essentialRegs[inst.dst]) {
+            dependencyChanged |= markEssentialReg(inst.left);
+          } else if (inst.op == IROp::Binary && essentialRegs[inst.dst]) {
+            dependencyChanged |= markEssentialReg(inst.left);
+            dependencyChanged |= markEssentialReg(inst.right);
           }
         }
+      } while (dependencyChanged);
+
+      const size_t count = current_.code.size();
+      std::unordered_map<std::string, size_t> labels;
+      for (size_t i = 0; i < count; ++i) {
+        if (current_.code[i].op == IROp::Label)
+          labels[current_.code[i].name] = i;
+      }
+      std::vector<std::vector<unsigned char>> liveIn(
+          count, std::vector<unsigned char>(current_.localCount));
+      std::vector<std::vector<unsigned char>> liveOut = liveIn;
+      bool dataflowChanged;
+      do {
+        dataflowChanged = false;
+        for (size_t reverse = count; reverse > 0; --reverse) {
+          const size_t index = reverse - 1;
+          const auto& inst = current_.code[index];
+          std::vector<unsigned char> out(current_.localCount);
+          auto mergeSuccessor = [&](size_t successor) {
+            if (successor >= count) return;
+            for (int slot = 0; slot < current_.localCount; ++slot)
+              out[slot] = static_cast<unsigned char>(
+                  out[slot] || liveIn[successor][slot]);
+          };
+          if (inst.op == IROp::Jump) {
+            mergeSuccessor(labels.at(inst.name));
+          } else if (inst.op == IROp::BranchZero) {
+            mergeSuccessor(labels.at(inst.name));
+            mergeSuccessor(index + 1);
+          } else if (inst.op != IROp::Return) {
+            mergeSuccessor(index + 1);
+          }
+          std::vector<unsigned char> in = out;
+          if (inst.op == IROp::StoreLocal) in[inst.left] = false;
+          if (inst.op == IROp::LoadLocal) in[inst.left] = true;
+          if (out != liveOut[index] || in != liveIn[index]) {
+            liveOut[index] = std::move(out);
+            liveIn[index] = std::move(in);
+            dataflowChanged = true;
+          }
+        }
+      } while (dataflowChanged);
+      for (size_t index = 0; index < count; ++index) {
+        const auto& inst = current_.code[index];
+        if (inst.op == IROp::StoreLocal &&
+            (!essentialLocals[inst.left] || !liveOut[index][inst.left]))
+          deadStores[index] = true;
       }
 
       for (size_t index = 0; index < current_.code.size(); ++index) {
@@ -1473,6 +1624,46 @@ class RiscVEmitter {
       }
     }
 
+    std::vector<int> useCounts(function.registerCount, 0);
+    std::vector<int> definitionPositions(function.registerCount, -1);
+    for (size_t i = 0; i < function.code.size(); ++i) {
+      const auto& inst = function.code[i];
+      if (inst.dst >= 0) definitionPositions[inst.dst] = static_cast<int>(i);
+      auto countUse = [&](int reg) {
+        if (reg >= 0) ++useCounts[reg];
+      };
+      switch (inst.op) {
+        case IROp::StoreLocal:
+        case IROp::StoreGlobal:
+          countUse(inst.right);
+          break;
+        case IROp::Unary:
+        case IROp::BranchZero:
+        case IROp::Return:
+          countUse(inst.left);
+          break;
+        case IROp::Binary:
+          countUse(inst.left);
+          countUse(inst.right);
+          break;
+        case IROp::Call:
+          for (int arg : inst.args) countUse(arg);
+          break;
+        default:
+          break;
+      }
+    }
+    for (size_t i = 1; i < function.code.size(); ++i) {
+      const auto& store = function.code[i];
+      if (store.op != IROp::StoreLocal || store.right < 0 ||
+          useCounts[store.right] != 1 ||
+          definitionPositions[store.right] != static_cast<int>(i - 1))
+        continue;
+      const int localPhysical = allocation.localRegisters[store.left];
+      if (localPhysical >= 0)
+        allocation.valueRegisters[store.right] = localPhysical;
+    }
+
     std::unordered_map<std::string, int> labelPositions;
     for (size_t i = 0; i < function.code.size(); ++i) {
       if (function.code[i].op == IROp::Label)
@@ -1496,7 +1687,7 @@ class RiscVEmitter {
     std::vector<int> values;
     for (int reg = 0; reg < function.registerCount; ++reg) {
       if (first[reg] != infinity && allocation.valueLocalAliases[reg] < 0)
-        values.push_back(reg);
+        if (allocation.valueRegisters[reg] < 0) values.push_back(reg);
     }
     std::stable_sort(values.begin(), values.end(), [&](int left, int right) {
       return first[left] < first[right];
@@ -1672,7 +1863,52 @@ class RiscVEmitter {
       }
     }
 
-    for (const auto& inst : function.code) {
+    std::vector<int> useCounts(function.registerCount, 0);
+    for (const auto& candidate : function.code) {
+      auto countUse = [&](int reg) {
+        if (reg >= 0) ++useCounts[reg];
+      };
+      switch (candidate.op) {
+        case IROp::StoreLocal:
+        case IROp::StoreGlobal: countUse(candidate.right); break;
+        case IROp::Unary:
+        case IROp::BranchZero:
+        case IROp::Return: countUse(candidate.left); break;
+        case IROp::Binary:
+          countUse(candidate.left);
+          countUse(candidate.right);
+          break;
+        case IROp::Call:
+          for (int arg : candidate.args) countUse(arg);
+          break;
+        default: break;
+      }
+    }
+
+    for (size_t pc = 0; pc < function.code.size(); ++pc) {
+      const auto& inst = function.code[pc];
+      if (inst.op == IROp::Binary && pc + 1 < function.code.size() &&
+          function.code[pc + 1].op == IROp::BranchZero &&
+          function.code[pc + 1].left == inst.dst &&
+          useCounts[inst.dst] == 1) {
+        const std::string left = valueOperand(function, inst.left, "t0");
+        const std::string right = valueOperand(function, inst.right, "t1");
+        const std::string& target = function.code[pc + 1].name;
+        switch (inst.binary) {
+          case BinaryOp::Lt: line("  bge " + left + ", " + right + ", " + target); break;
+          case BinaryOp::Gt: line("  bge " + right + ", " + left + ", " + target); break;
+          case BinaryOp::Le: line("  blt " + right + ", " + left + ", " + target); break;
+          case BinaryOp::Ge: line("  blt " + left + ", " + right + ", " + target); break;
+          case BinaryOp::Eq: line("  bne " + left + ", " + right + ", " + target); break;
+          case BinaryOp::Ne: line("  beq " + left + ", " + right + ", " + target); break;
+          default:
+            emitBinary(function, inst);
+            line("  beqz " + valueOperand(function, inst.dst, "t0") + ", " + target);
+            break;
+        }
+        ++pc;
+        continue;
+      }
       switch (inst.op) {
         case IROp::Imm:
           {
