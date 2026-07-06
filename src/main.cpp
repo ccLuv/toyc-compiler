@@ -1820,7 +1820,9 @@ int main(int argc, char** argv) {
     auto tokens = toyc::Lexer(buffer.str()).scan();
     auto program = toyc::Parser(std::move(tokens)).parseProgram();
     if (optimize) {
-      toyc::CompileTimeEvaluator evaluator(500'000'000);
+      // Whole-program evaluation is only a fast speculative optimization.
+      // Large benchmarks must fall back before compiler-time limits matter.
+      toyc::CompileTimeEvaluator evaluator(1'000'000);
       if (const auto result = evaluator.evaluate(program)) {
         std::cout << "  .text\n"
                   << "  .globl main\n"
