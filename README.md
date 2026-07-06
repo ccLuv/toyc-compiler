@@ -70,11 +70,12 @@ backward dependency slice from observable results. Basic-block copy propagation
 and common-subexpression elimination remove redundant value chains.
 
 Because ToyC has no external input or I/O and `main` has no parameters, the
-optimized driver first attempts budgeted whole-program evaluation on the AST.
-When evaluation completes, it emits a constant-time `main` containing only the
-computed return value. Tail-recursive calls are evaluated iteratively. Programs
-that exceed the step, wall-clock, or recursion budget automatically fall back
-to the normal optimized IR and RV32 backend.
+optimized driver attempts budgeted whole-program evaluation on optimized IR.
+The evaluator uses integer arrays for locals and virtual registers and
+pre-resolves labels. Pure functions are memoized by argument values. When
+evaluation completes, the compiler emits a constant-time `main` containing
+only the computed return value. Programs that exceed the step, wall-clock, or
+recursion budget automatically fall back to the normal optimized RV32 backend.
 
 The backend counts accesses to local variables and keeps the hottest locals in
 callee-saved registers. Remaining `s1-s11` registers are assigned to virtual

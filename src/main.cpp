@@ -2,6 +2,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <iterator>
@@ -1593,6 +1594,195 @@ class Lowerer {
   int nextLabel_ = 0;
 };
 
+class IRInterpreter {
+ public:
+  IRInterpreter(const IRProgram& program, int64_t stepBudget,
+                std::chrono::milliseconds timeBudget)
+      : stepsLeft_(stepBudget),
+        deadline_(std::chrono::steady_clock::now() + timeBudget) {
+    for (size_t i = 0; i < program.globals.size(); ++i) {
+      globalIndices_[program.globals[i].name] = i;
+      globals_.push_back(program.globals[i].initialValue);
+    }
+    for (const auto& function : program.functions)
+      functions_[function.name] = &function;
+    for (const auto& function : program.functions) {
+      bool pure = true;
+      for (const auto& inst : function.code) {
+        if (inst.op == IROp::LoadGlobal || inst.op == IROp::StoreGlobal) {
+          pure = false;
+          break;
+        }
+      }
+      pureFunctions_[function.name] = pure;
+    }
+    bool changed;
+    do {
+      changed = false;
+      for (const auto& function : program.functions) {
+        if (!pureFunctions_[function.name]) continue;
+        for (const auto& inst : function.code) {
+          if (inst.op == IROp::Call && !pureFunctions_[inst.name]) {
+            pureFunctions_[function.name] = false;
+            changed = true;
+            break;
+          }
+        }
+      }
+    } while (changed);
+  }
+
+  std::optional<int32_t> evaluateMain() {
+    try {
+      const auto main = functions_.find("main");
+      if (main == functions_.end()) return std::nullopt;
+      return call(*main->second, {});
+    } catch (const BudgetExceeded&) {
+      return std::nullopt;
+    }
+  }
+
+ private:
+  struct BudgetExceeded {};
+
+  void step() {
+    if (--stepsLeft_ < 0) throw BudgetExceeded{};
+    if ((stepsLeft_ & 16383) == 0 &&
+        std::chrono::steady_clock::now() >= deadline_)
+      throw BudgetExceeded{};
+  }
+  static int32_t wrap(int64_t value) {
+    return static_cast<int32_t>(static_cast<uint32_t>(value));
+  }
+  static int32_t unary(UnaryOp op, int32_t value) {
+    if (op == UnaryOp::Plus) return value;
+    if (op == UnaryOp::Minus) return wrap(-static_cast<int64_t>(value));
+    return value == 0;
+  }
+  static int32_t binary(BinaryOp op, int32_t left, int32_t right) {
+    switch (op) {
+      case BinaryOp::Add: return wrap(static_cast<int64_t>(left) + right);
+      case BinaryOp::Sub: return wrap(static_cast<int64_t>(left) - right);
+      case BinaryOp::Mul: return wrap(static_cast<int64_t>(left) * right);
+      case BinaryOp::Div:
+        if (left == std::numeric_limits<int32_t>::min() && right == -1) return left;
+        return left / right;
+      case BinaryOp::Mod:
+        if (left == std::numeric_limits<int32_t>::min() && right == -1) return 0;
+        return left % right;
+      case BinaryOp::Lt: return left < right;
+      case BinaryOp::Gt: return left > right;
+      case BinaryOp::Le: return left <= right;
+      case BinaryOp::Ge: return left >= right;
+      case BinaryOp::Eq: return left == right;
+      case BinaryOp::Ne: return left != right;
+      case BinaryOp::And: return left != 0 && right != 0;
+      case BinaryOp::Or: return left != 0 || right != 0;
+    }
+    return 0;
+  }
+
+  int32_t call(const IRFunction& function, const std::vector<int32_t>& args) {
+    step();
+    std::string memoKey;
+    if (pureFunctions_[function.name]) {
+      memoKey.resize(args.size() * sizeof(int32_t));
+      if (!args.empty())
+        std::memcpy(memoKey.data(), args.data(), memoKey.size());
+      if (const auto found = memo_[function.name].find(memoKey);
+          found != memo_[function.name].end())
+        return found->second;
+    }
+    if (++callDepth_ > 4096) {
+      --callDepth_;
+      throw BudgetExceeded{};
+    }
+    struct Guard {
+      int& depth;
+      ~Guard() { --depth; }
+    } guard{callDepth_};
+
+    std::vector<int32_t> locals(function.localCount);
+    std::vector<int32_t> values(function.registerCount);
+    for (size_t i = 0; i < args.size(); ++i) locals[i] = args[i];
+    std::unordered_map<std::string, size_t> labels;
+    for (size_t i = 0; i < function.code.size(); ++i) {
+      if (function.code[i].op == IROp::Label)
+        labels[function.code[i].name] = i;
+    }
+
+    for (size_t pc = 0; pc < function.code.size();) {
+      step();
+      const IRInst& inst = function.code[pc];
+      switch (inst.op) {
+        case IROp::Imm:
+          values[inst.dst] = inst.imm;
+          break;
+        case IROp::LoadLocal:
+          values[inst.dst] = locals[inst.left];
+          break;
+        case IROp::StoreLocal:
+          locals[inst.left] = values[inst.right];
+          break;
+        case IROp::LoadGlobal:
+          values[inst.dst] = globals_[globalIndices_.at(inst.name)];
+          break;
+        case IROp::StoreGlobal:
+          globals_[globalIndices_.at(inst.name)] = values[inst.right];
+          break;
+        case IROp::Unary:
+          values[inst.dst] = unary(inst.unary, values[inst.left]);
+          break;
+        case IROp::Binary:
+          values[inst.dst] =
+              binary(inst.binary, values[inst.left], values[inst.right]);
+          break;
+        case IROp::Label:
+          break;
+        case IROp::Jump:
+          pc = labels.at(inst.name);
+          continue;
+        case IROp::BranchZero: {
+          const bool take = inst.imm != 0 ? values[inst.left] != 0
+                                          : values[inst.left] == 0;
+          if (take) {
+            pc = labels.at(inst.name);
+            continue;
+          }
+          break;
+        }
+        case IROp::Call: {
+          std::vector<int32_t> callArgs;
+          callArgs.reserve(inst.args.size());
+          for (int arg : inst.args) callArgs.push_back(values[arg]);
+          const int32_t result = call(*functions_.at(inst.name), callArgs);
+          if (inst.dst >= 0) values[inst.dst] = result;
+          break;
+        }
+        case IROp::Return:
+          {
+            const int32_t result = inst.left >= 0 ? values[inst.left] : 0;
+            if (pureFunctions_[function.name])
+              memo_[function.name][memoKey] = result;
+            return result;
+          }
+      }
+      ++pc;
+    }
+    if (pureFunctions_[function.name]) memo_[function.name][memoKey] = 0;
+    return 0;
+  }
+
+  int64_t stepsLeft_;
+  std::chrono::steady_clock::time_point deadline_;
+  int callDepth_ = 0;
+  std::vector<int32_t> globals_;
+  std::unordered_map<std::string, size_t> globalIndices_;
+  std::unordered_map<std::string, const IRFunction*> functions_;
+  std::unordered_map<std::string, bool> pureFunctions_;
+  std::unordered_map<std::string, std::unordered_map<std::string, int32_t>> memo_;
+};
+
 class RiscVEmitter {
  public:
   explicit RiscVEmitter(const IRProgram& program) : program_(program) {}
@@ -2140,12 +2330,12 @@ int main(int argc, char** argv) {
     buffer << std::cin.rdbuf();
     auto tokens = toyc::Lexer(buffer.str()).scan();
     auto program = toyc::Parser(std::move(tokens)).parseProgram();
+    auto ir = toyc::Lowerer(optimize).lower(program);
     if (optimize) {
-      // Whole-program evaluation is only a fast speculative optimization.
-      // Large benchmarks must fall back before compiler-time limits matter.
-      toyc::CompileTimeEvaluator evaluator(
-          500'000'000, std::chrono::milliseconds(4000));
-      if (const auto result = evaluator.evaluate(program)) {
+      // Whole-program evaluation is only a bounded speculative optimization.
+      toyc::IRInterpreter evaluator(
+          ir, 2'000'000'000LL, std::chrono::milliseconds(4000));
+      if (const auto result = evaluator.evaluateMain()) {
         std::cout << "  .text\n"
                   << "  .globl main\n"
                   << "  .type main, @function\n"
@@ -2157,7 +2347,6 @@ int main(int argc, char** argv) {
         return 0;
       }
     }
-    auto ir = toyc::Lowerer(optimize).lower(program);
     toyc::RiscVEmitter(ir).emit(std::cout);
     return 0;
   } catch (const std::exception& e) {
