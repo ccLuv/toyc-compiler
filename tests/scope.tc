@@ -1,0 +1,15 @@
+int main() {
+  int x = 3;
+  int result = x;
+  {
+    int x = 7;
+    result = result * 10 + x;
+    {
+      const int x = 9;
+      result = result * 10 + x;
+    }
+    result = result * 10 + x;
+  }
+  result = result * 10 + x;
+  return result % 256;
+}

@@ -1,0 +1,11 @@
+/build/
+/test-build/
+/compiler
+/compiler.exe
+*.o
+*.exe
+
+/.agents/
+/.codex/
+/outputs/
+/work/

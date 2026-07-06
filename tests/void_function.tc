@@ -1,0 +1,12 @@
+int value = 1;
+
+void update(int amount) {
+  value = value * 10 + amount;
+  return;
+}
+
+int main() {
+  update(2);
+  update(3);
+  return value;
+}

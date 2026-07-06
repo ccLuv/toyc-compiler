@@ -1,0 +1,14 @@
+const int A = 2 + 3 * 4;
+const int B = A > 10 && A != 15;
+int counter = A - 10;
+
+int bump(int amount) {
+  counter = counter + amount;
+  return counter;
+}
+
+int main() {
+  int first = bump(A);
+  int second = bump(B);
+  return first * 10 + second;
+}

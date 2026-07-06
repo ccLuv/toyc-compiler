@@ -1,0 +1,14 @@
+int main() {
+  int a = -17;
+  int b = 5;
+  int result = 0;
+  result = result + (a / b == -3);
+  result = result + 2 * (a % b == -2);
+  result = result + 4 * (1 + 2 * 3 == 7);
+  result = result + 8 * (3 < 4);
+  result = result + 16 * (4 >= 4);
+  result = result + 32 * (4 != 5);
+  result = result + 64 * (!0);
+  result = result + 128 * (!!9);
+  return result;
+}

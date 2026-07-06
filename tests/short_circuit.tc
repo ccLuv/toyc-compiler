@@ -1,0 +1,13 @@
+int touched = 0;
+
+int mark() {
+  touched = touched + 1;
+  return 1;
+}
+
+int main() {
+  int a = 0 && mark();
+  int b = 1 || mark();
+  if (a || !b) return 99;
+  return touched;
+}
