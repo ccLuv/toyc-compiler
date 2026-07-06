@@ -73,8 +73,8 @@ Because ToyC has no external input or I/O and `main` has no parameters, the
 optimized driver first attempts budgeted whole-program evaluation on the AST.
 When evaluation completes, it emits a constant-time `main` containing only the
 computed return value. Tail-recursive calls are evaluated iteratively. Programs
-that exceed the step or recursion budget automatically fall back to the normal
-optimized IR and RV32 backend.
+that exceed the step, wall-clock, or recursion budget automatically fall back
+to the normal optimized IR and RV32 backend.
 
 The backend counts accesses to local variables and keeps the hottest locals in
 callee-saved registers. Remaining `s1-s11` registers are assigned to virtual
@@ -84,6 +84,7 @@ loop-invariant values. The instruction selector directly consumes allocated
 registers instead of routing every operation through temporary registers.
 Comparison-plus-branch and expression-plus-local-store patterns are fused, so
 typical counting loops use a direct conditional branch, one update, and one
-back-edge jump.
+back-edge jump. Loop rotation further changes hot while loops to a bottom-tested
+form, removing the unconditional jump from steady-state iterations.
 Every function saves and restores the callee-saved registers it uses. Direct
 12-bit stack offsets are emitted whenever possible.

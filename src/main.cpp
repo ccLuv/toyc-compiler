@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -439,7 +440,10 @@ class Parser {
 
 class CompileTimeEvaluator {
  public:
-  explicit CompileTimeEvaluator(int64_t stepBudget) : stepsLeft_(stepBudget) {}
+  CompileTimeEvaluator(int64_t stepBudget,
+                       std::chrono::milliseconds timeBudget)
+      : stepsLeft_(stepBudget),
+        deadline_(std::chrono::steady_clock::now() + timeBudget) {}
 
   std::optional<int32_t> evaluate(const Program& program) {
     try {
@@ -475,6 +479,9 @@ class CompileTimeEvaluator {
 
   void step() {
     if (--stepsLeft_ < 0) throw BudgetExceeded{};
+    if ((stepsLeft_ & 4095) == 0 &&
+        std::chrono::steady_clock::now() >= deadline_)
+      throw BudgetExceeded{};
   }
   static int32_t wrap(int64_t value) {
     return static_cast<int32_t>(static_cast<uint32_t>(value));
@@ -630,6 +637,7 @@ class CompileTimeEvaluator {
   }
 
   int64_t stepsLeft_;
+  std::chrono::steady_clock::time_point deadline_;
   int callDepth_ = 0;
   std::unordered_map<std::string, int32_t> globals_;
   std::unordered_map<std::string, const Function*> functions_;
@@ -810,6 +818,7 @@ class Lowerer {
       hoistAndDeduplicateConstants();
       eliminateCopiesAndCommonExpressions();
       eliminateDeadCode();
+      rotateLoops();
     }
     current_.registerCount = nextReg_;
     output_.functions.push_back(std::move(current_));
@@ -1301,6 +1310,67 @@ class Lowerer {
     }
   }
 
+  void rotateLoops() {
+    for (;;) {
+      std::unordered_map<std::string, size_t> labels;
+      for (size_t i = 0; i < current_.code.size(); ++i) {
+        if (current_.code[i].op == IROp::Label)
+          labels[current_.code[i].name] = i;
+      }
+      size_t bestBegin = current_.code.size();
+      size_t bestBranch = 0;
+      size_t bestJump = 0;
+      size_t bestSpan = current_.code.size() + 1;
+      for (size_t jump = 0; jump + 1 < current_.code.size(); ++jump) {
+        if (current_.code[jump].op != IROp::Jump ||
+            current_.code[jump + 1].op != IROp::Label)
+          continue;
+        const auto target = labels.find(current_.code[jump].name);
+        if (target == labels.end() || target->second >= jump) continue;
+        const std::string& endLabel = current_.code[jump + 1].name;
+        for (size_t branch = target->second + 1; branch < jump; ++branch) {
+          if (current_.code[branch].op == IROp::BranchZero &&
+              current_.code[branch].name == endLabel) {
+            const size_t span = jump - target->second;
+            if (span < bestSpan) {
+              bestBegin = target->second;
+              bestBranch = branch;
+              bestJump = jump;
+              bestSpan = span;
+            }
+            break;
+          }
+        }
+      }
+      if (bestBegin == current_.code.size()) return;
+
+      const std::string bodyLabel = newLabel("rotated_body");
+      std::vector<IRInst> rewritten;
+      rewritten.reserve(current_.code.size() + 2);
+      for (size_t i = 0; i < bestBegin; ++i)
+        rewritten.push_back(std::move(current_.code[i]));
+      IRInst initialJump{IROp::Jump};
+      initialJump.name = current_.code[bestBegin].name;
+      rewritten.push_back(std::move(initialJump));
+      IRInst body{IROp::Label};
+      body.name = bodyLabel;
+      rewritten.push_back(std::move(body));
+      for (size_t i = bestBranch + 1; i < bestJump; ++i)
+        rewritten.push_back(std::move(current_.code[i]));
+      rewritten.push_back(std::move(current_.code[bestBegin]));
+      for (size_t i = bestBegin + 1; i < bestBranch; ++i)
+        rewritten.push_back(std::move(current_.code[i]));
+      IRInst branch = std::move(current_.code[bestBranch]);
+      branch.name = bodyLabel;
+      branch.imm = 1;
+      rewritten.push_back(std::move(branch));
+      rewritten.push_back(std::move(current_.code[bestJump + 1]));
+      for (size_t i = bestJump + 2; i < current_.code.size(); ++i)
+        rewritten.push_back(std::move(current_.code[i]));
+      current_.code = std::move(rewritten);
+    }
+  }
+
   int emitImm(int32_t value) {
     const int result = newReg();
     IRInst inst{IROp::Imm};
@@ -1671,7 +1741,7 @@ class RiscVEmitter {
     }
     for (size_t i = 0; i < function.code.size(); ++i) {
       const auto& inst = function.code[i];
-      if (inst.op != IROp::Jump) continue;
+      if (inst.op != IROp::Jump && inst.op != IROp::BranchZero) continue;
       const auto target = labelPositions.find(inst.name);
       if (target == labelPositions.end() ||
           target->second >= static_cast<int>(i))
@@ -1893,8 +1963,22 @@ class RiscVEmitter {
           useCounts[inst.dst] == 1) {
         const std::string left = valueOperand(function, inst.left, "t0");
         const std::string right = valueOperand(function, inst.right, "t1");
-        const std::string& target = function.code[pc + 1].name;
-        switch (inst.binary) {
+        const auto& branch = function.code[pc + 1];
+        const std::string& target = branch.name;
+        if (branch.imm != 0) {
+          switch (inst.binary) {
+            case BinaryOp::Lt: line("  blt " + left + ", " + right + ", " + target); break;
+            case BinaryOp::Gt: line("  blt " + right + ", " + left + ", " + target); break;
+            case BinaryOp::Le: line("  bge " + right + ", " + left + ", " + target); break;
+            case BinaryOp::Ge: line("  bge " + left + ", " + right + ", " + target); break;
+            case BinaryOp::Eq: line("  beq " + left + ", " + right + ", " + target); break;
+            case BinaryOp::Ne: line("  bne " + left + ", " + right + ", " + target); break;
+            default:
+              emitBinary(function, inst);
+              line("  bnez " + valueOperand(function, inst.dst, "t0") + ", " + target);
+              break;
+          }
+        } else switch (inst.binary) {
           case BinaryOp::Lt: line("  bge " + left + ", " + right + ", " + target); break;
           case BinaryOp::Gt: line("  bge " + right + ", " + left + ", " + target); break;
           case BinaryOp::Le: line("  blt " + right + ", " + left + ", " + target); break;
@@ -1958,7 +2042,8 @@ class RiscVEmitter {
           line("  j " + inst.name);
           break;
         case IROp::BranchZero:
-          line("  beqz " + valueOperand(function, inst.left, "t0") + ", " + inst.name);
+          line("  b" + std::string(inst.imm != 0 ? "nez " : "eqz ") +
+               valueOperand(function, inst.left, "t0") + ", " + inst.name);
           break;
         case IROp::Call:
           emitCall(function, inst);
@@ -2058,7 +2143,8 @@ int main(int argc, char** argv) {
     if (optimize) {
       // Whole-program evaluation is only a fast speculative optimization.
       // Large benchmarks must fall back before compiler-time limits matter.
-      toyc::CompileTimeEvaluator evaluator(1'000'000);
+      toyc::CompileTimeEvaluator evaluator(
+          500'000'000, std::chrono::milliseconds(750));
       if (const auto result = evaluator.evaluate(program)) {
         std::cout << "  .text\n"
                   << "  .globl main\n"
