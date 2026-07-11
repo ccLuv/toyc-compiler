@@ -1,0 +1,6 @@
+﻿Issue,PR,阶段,分支,测试文件,修复文件,关键 Commit,状态
+#1,待补,前期,fix/issue-001-short-circuit-side-effect,tests/short_circuit.tc; tests/short_circuit.expected,src/main.cpp,568865a 或实际 PR 合入 commit,待创建 Issue/PR
+#2,待补,中期,fix/issue-002-nested-loop-labels,tests/nested_loops.tc; tests/nested_loops.expected,src/main.cpp,248743d 或实际 PR 合入 commit,待创建 Issue/PR
+#3,待补,前期,fix/issue-003-stack-arguments,tests/many_args.tc; tests/many_args.expected,src/main.cpp,568865a 或实际 PR 合入 commit,待创建 Issue/PR
+#4,待补,中期,fix/issue-004-tail-recursion-result,tests/tail_recursion.tc; tests/tail_recursion.expected,src/main.cpp,634b1d7 或实际 PR 合入 commit,待创建 Issue/PR
+#5,待补,后期,fix/issue-005-readonly-global-propagation,tests/readonly_global.tc; tests/readonly_global.expected,src/main.cpp,634b1d7 或实际 PR 合入 commit,待创建 Issue/PR
