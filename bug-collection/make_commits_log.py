@@ -13,53 +13,53 @@ ROWS = [
     ["Issue", "PR", "阶段", "分支", "测试文件", "修复文件", "关键 Commit", "状态"],
     [
         "#1",
-        "待补",
+        "#6",
         "前期",
         "fix/issue-001-short-circuit-side-effect",
         "tests/short_circuit.tc; tests/short_circuit.expected",
-        "src/main.cpp",
-        "568865a 或实际 PR 合入 commit",
-        "待创建 Issue/PR",
+        "src/main.cpp; bug-collection/issue-001/README.md",
+        "dc70bd9 / merge 428de6d",
+        "已合入 main",
     ],
     [
         "#2",
-        "待补",
+        "#7",
         "中期",
         "fix/issue-002-nested-loop-labels",
         "tests/nested_loops.tc; tests/nested_loops.expected",
-        "src/main.cpp",
-        "248743d 或实际 PR 合入 commit",
-        "待创建 Issue/PR",
+        "src/main.cpp; bug-collection/issue-002/README.md",
+        "db97fd4 / merge b7ebc39",
+        "已合入 main",
     ],
     [
         "#3",
-        "待补",
+        "#8",
         "前期",
         "fix/issue-003-stack-arguments",
         "tests/many_args.tc; tests/many_args.expected",
-        "src/main.cpp",
-        "568865a 或实际 PR 合入 commit",
-        "待创建 Issue/PR",
+        "src/main.cpp; bug-collection/issue-003/README.md",
+        "40a1fae / merge 68efd93",
+        "已合入 main",
     ],
     [
         "#4",
-        "待补",
+        "#9",
         "中期",
         "fix/issue-004-tail-recursion-result",
         "tests/tail_recursion.tc; tests/tail_recursion.expected",
-        "src/main.cpp",
-        "634b1d7 或实际 PR 合入 commit",
-        "待创建 Issue/PR",
+        "src/main.cpp; bug-collection/issue-004/README.md",
+        "bf3975e / merge 45678cc",
+        "已合入 main",
     ],
     [
         "#5",
-        "待补",
+        "#10",
         "后期",
         "fix/issue-005-readonly-global-propagation",
         "tests/readonly_global.tc; tests/readonly_global.expected",
-        "src/main.cpp",
-        "634b1d7 或实际 PR 合入 commit",
-        "待创建 Issue/PR",
+        "src/main.cpp; bug-collection/issue-005/README.md",
+        "2399f1b / merge 98afee8",
+        "已合入 main",
     ],
 ]
 
@@ -98,11 +98,11 @@ def sheet_xml():
         '<col min="1" max="1" width="10" customWidth="1"/>'
         '<col min="2" max="2" width="10" customWidth="1"/>'
         '<col min="3" max="3" width="10" customWidth="1"/>'
-        '<col min="4" max="4" width="38" customWidth="1"/>'
+        '<col min="4" max="4" width="42" customWidth="1"/>'
         '<col min="5" max="5" width="46" customWidth="1"/>'
-        '<col min="6" max="6" width="18" customWidth="1"/>'
-        '<col min="7" max="7" width="34" customWidth="1"/>'
-        '<col min="8" max="8" width="20" customWidth="1"/>'
+        '<col min="6" max="6" width="44" customWidth="1"/>'
+        '<col min="7" max="7" width="30" customWidth="1"/>'
+        '<col min="8" max="8" width="18" customWidth="1"/>'
         '</cols>'
         f'<sheetData>{"".join(rows)}</sheetData>'
         '</worksheet>'
