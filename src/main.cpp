@@ -1348,6 +1348,11 @@ class Lowerer {
     }, expr.node);
   }
 
+  static bool exprIsLoopInvariant(const Expr& expr,
+                                  const std::unordered_set<std::string>& assigned) {
+    return !exprHasCall(expr) && !exprReadsAny(expr, assigned);
+  }
+
   static bool isIncrementByOne(const Stmt::Assign& assign, const std::string& name) {
     if (assign.name != name) return false;
     const auto* binary = std::get_if<Expr::Binary>(&assign.value->node);
@@ -1391,6 +1396,73 @@ class Lowerer {
     inst.binary = op;
     emit(std::move(inst));
     return result;
+  }
+
+  static bool isSupportedLoopAddend(const Expr& expr, const std::string& counter,
+                                    const std::unordered_set<std::string>& assigned) {
+    if (exprIsLoopInvariant(expr, assigned) || isName(expr, counter)) return true;
+    const auto* binary = std::get_if<Expr::Binary>(&expr.node);
+    if (!binary) return false;
+    const bool leftCounter = isName(*binary->left, counter);
+    const bool rightCounter = isName(*binary->right, counter);
+    if (binary->op == BinaryOp::Mul)
+      return (leftCounter && exprIsLoopInvariant(*binary->right, assigned)) ||
+             (rightCounter && exprIsLoopInvariant(*binary->left, assigned));
+    if (binary->op == BinaryOp::Add || binary->op == BinaryOp::Sub)
+      return (leftCounter && exprIsLoopInvariant(*binary->right, assigned)) ||
+             (rightCounter && exprIsLoopInvariant(*binary->left, assigned));
+    return false;
+  }
+
+  int emitCounterSeries(int counterReg, int iterations, int32_t limitValue) {
+    if (limitValue == std::numeric_limits<int32_t>::min())
+      fail("unsupported counted loop bound");
+    const int last = emitImm(limitValue - 1);
+    const int firstPlusLast = emitBinaryReg(BinaryOp::Add, counterReg, last);
+    const int product = emitBinaryReg(BinaryOp::Mul, iterations, firstPlusLast);
+    const int two = emitImm(2);
+    return emitBinaryReg(BinaryOp::Div, product, two);
+  }
+
+  int emitLoopDelta(const Expr& expr, const std::string& counter,
+                    const std::unordered_set<std::string>& assigned,
+                    int counterReg, int iterations, int32_t limitValue) {
+    if (exprIsLoopInvariant(expr, assigned)) {
+      Value addend = lowerExpr(expr);
+      requireInt(addend, "loop accumulator");
+      return emitBinaryReg(BinaryOp::Mul, addend.reg, iterations);
+    }
+    if (isName(expr, counter)) {
+      return emitCounterSeries(counterReg, iterations, limitValue);
+    }
+
+    const auto* binary = std::get_if<Expr::Binary>(&expr.node);
+    if (!binary) fail("unsupported loop addend");
+    const bool leftCounter = isName(*binary->left, counter);
+    const bool rightCounter = isName(*binary->right, counter);
+    const Expr* invariant = nullptr;
+    if (leftCounter && exprIsLoopInvariant(*binary->right, assigned))
+      invariant = binary->right.get();
+    else if (rightCounter && exprIsLoopInvariant(*binary->left, assigned))
+      invariant = binary->left.get();
+    else
+      fail("unsupported loop addend");
+
+    Value invariantValue = lowerExpr(*invariant);
+    requireInt(invariantValue, "loop accumulator");
+    const int invariantDelta = emitBinaryReg(BinaryOp::Mul, invariantValue.reg, iterations);
+    const int counterDelta = emitCounterSeries(counterReg, iterations, limitValue);
+
+    if (binary->op == BinaryOp::Mul)
+      return emitBinaryReg(BinaryOp::Mul, counterDelta, invariantValue.reg);
+    if (binary->op == BinaryOp::Add)
+      return emitBinaryReg(BinaryOp::Add, counterDelta, invariantDelta);
+    if (binary->op == BinaryOp::Sub) {
+      if (leftCounter)
+        return emitBinaryReg(BinaryOp::Sub, counterDelta, invariantDelta);
+      return emitBinaryReg(BinaryOp::Sub, invariantDelta, counterDelta);
+    }
+    fail("unsupported loop addend");
   }
 
   Value lowerNameValue(const std::string& name) {
@@ -1451,8 +1523,7 @@ class Lowerer {
 
     if (incrementCount != 1) return false;
     for (const auto& update : updates) {
-      if (!update.addend || exprHasCall(*update.addend) ||
-          exprReadsAny(*update.addend, assigned))
+      if (!update.addend || !isSupportedLoopAddend(*update.addend, counter, assigned))
         return false;
     }
 
@@ -1469,10 +1540,9 @@ class Lowerer {
     const int iterations = emitBinaryReg(BinaryOp::Sub, limit, counterValue.reg);
     for (const auto& update : updates) {
       Value base = lowerNameValue(update.target);
-      Value addend = lowerExpr(*update.addend);
       requireInt(base, "loop accumulator");
-      requireInt(addend, "loop accumulator");
-      const int delta = emitBinaryReg(BinaryOp::Mul, addend.reg, iterations);
+      const int delta = emitLoopDelta(*update.addend, counter, assigned, counterValue.reg,
+                                      iterations, limitValue);
       const int result = emitBinaryReg(update.sign > 0 ? BinaryOp::Add : BinaryOp::Sub,
                                       base.reg, delta);
       emitStoreName(update.target, result);
