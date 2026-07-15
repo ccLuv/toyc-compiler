@@ -69,14 +69,6 @@ Dead stores are identified with iterative CFG local-variable liveness plus a
 backward dependency slice from observable results. Basic-block copy propagation
 and common-subexpression elimination remove redundant value chains.
 
-Because ToyC has no external input or I/O and `main` has no parameters, the
-optimized driver attempts budgeted whole-program evaluation on optimized IR.
-The evaluator uses integer arrays for locals and virtual registers and
-pre-resolves labels. Pure functions are memoized by argument values. When
-evaluation completes, the compiler emits a constant-time `main` containing
-only the computed return value. Programs that exceed the step, wall-clock, or
-recursion budget automatically fall back to the normal optimized RV32 backend.
-
 The backend counts accesses to local variables and keeps the hottest locals in
 callee-saved registers. Remaining `s1-s11` registers are assigned to virtual
 registers with linear-scan live intervals; overlapping values spill to stable
@@ -89,3 +81,7 @@ back-edge jump. Loop rotation further changes hot while loops to a bottom-tested
 form, removing the unconditional jump from steady-state iterations.
 Every function saves and restores the callee-saved registers it uses. Direct
 12-bit stack offsets are emitted whenever possible.
+
+The optimizer does not execute `main` during compilation. Both normal and
+`-opt` modes emit equivalent RV32IM assembly through the general
+code-generation backend.
