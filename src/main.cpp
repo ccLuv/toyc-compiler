@@ -11,6 +11,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -667,6 +668,7 @@ class Lowerer {
 
   void optimizeCurrentFunction() {
     std::unordered_map<int, int32_t> constants;
+    std::vector<std::optional<int32_t>> localConstants(current_.localCount);
     for (auto& inst : current_.code) {
       if (inst.op == IROp::Imm) {
         constants[inst.dst] = inst.imm;
@@ -742,12 +744,32 @@ class Lowerer {
             constants.erase(dst);
           }
         }
-      } else if (inst.op == IROp::LoadLocal || inst.op == IROp::LoadGlobal ||
-                 inst.op == IROp::Call) {
+      } else if (inst.op == IROp::LoadLocal) {
+        if (inst.left >= 0 && inst.left < static_cast<int>(localConstants.size()) &&
+            localConstants[inst.left]) {
+          const int dst = inst.dst;
+          const int32_t value = *localConstants[inst.left];
+          inst = IRInst{IROp::Imm};
+          inst.dst = dst;
+          inst.imm = value;
+          constants[dst] = value;
+        } else if (inst.dst >= 0) {
+          constants.erase(inst.dst);
+        }
+      } else if (inst.op == IROp::StoreLocal) {
+        const auto value = constants.find(inst.right);
+        if (inst.left >= 0 && inst.left < static_cast<int>(localConstants.size())) {
+          if (value != constants.end()) localConstants[inst.left] = value->second;
+          else localConstants[inst.left].reset();
+        }
+      } else if (inst.op == IROp::LoadGlobal || inst.op == IROp::Call) {
         if (inst.dst >= 0) constants.erase(inst.dst);
+        if (inst.op == IROp::Call)
+          std::fill(localConstants.begin(), localConstants.end(), std::nullopt);
       } else if (inst.op == IROp::Label || inst.op == IROp::Jump ||
                  inst.op == IROp::BranchZero) {
         constants.clear();
+        std::fill(localConstants.begin(), localConstants.end(), std::nullopt);
       }
     }
   }
@@ -1281,6 +1303,187 @@ class Lowerer {
     return {result, Type::Int};
   }
 
+  static bool isName(const Expr& expr, const std::string& name) {
+    const auto* node = std::get_if<Expr::Name>(&expr.node);
+    return node && node->value == name;
+  }
+
+  static bool numberValue(const Expr& expr, int32_t& value) {
+    if (const auto* node = std::get_if<Expr::Number>(&expr.node)) {
+      value = node->value;
+      return true;
+    }
+    return false;
+  }
+
+  static bool exprHasCall(const Expr& expr) {
+    return std::visit([&](const auto& node) -> bool {
+      using T = std::decay_t<decltype(node)>;
+      if constexpr (std::is_same_v<T, Expr::Unary>) {
+        return exprHasCall(*node.operand);
+      } else if constexpr (std::is_same_v<T, Expr::Binary>) {
+        return exprHasCall(*node.left) || exprHasCall(*node.right);
+      } else if constexpr (std::is_same_v<T, Expr::Call>) {
+        return true;
+      } else {
+        return false;
+      }
+    }, expr.node);
+  }
+
+  static bool exprReadsAny(const Expr& expr, const std::unordered_set<std::string>& names) {
+    return std::visit([&](const auto& node) -> bool {
+      using T = std::decay_t<decltype(node)>;
+      if constexpr (std::is_same_v<T, Expr::Name>) {
+        return names.contains(node.value);
+      } else if constexpr (std::is_same_v<T, Expr::Unary>) {
+        return exprReadsAny(*node.operand, names);
+      } else if constexpr (std::is_same_v<T, Expr::Binary>) {
+        return exprReadsAny(*node.left, names) || exprReadsAny(*node.right, names);
+      } else if constexpr (std::is_same_v<T, Expr::Call>) {
+        return true;
+      } else {
+        return false;
+      }
+    }, expr.node);
+  }
+
+  static bool isIncrementByOne(const Stmt::Assign& assign, const std::string& name) {
+    if (assign.name != name) return false;
+    const auto* binary = std::get_if<Expr::Binary>(&assign.value->node);
+    if (!binary || binary->op != BinaryOp::Add) return false;
+    int32_t value = 0;
+    return (isName(*binary->left, name) && numberValue(*binary->right, value) && value == 1) ||
+           (isName(*binary->right, name) && numberValue(*binary->left, value) && value == 1);
+  }
+
+  struct AccumulationUpdate {
+    std::string target;
+    const Expr* addend = nullptr;
+    int sign = 1;
+  };
+
+  static bool parseAccumulationUpdate(const Stmt::Assign& assign,
+                                      AccumulationUpdate& update) {
+    const auto* binary = std::get_if<Expr::Binary>(&assign.value->node);
+    if (!binary) return false;
+    if (binary->op == BinaryOp::Add && isName(*binary->left, assign.name)) {
+      update = {assign.name, binary->right.get(), 1};
+      return true;
+    }
+    if (binary->op == BinaryOp::Add && isName(*binary->right, assign.name)) {
+      update = {assign.name, binary->left.get(), 1};
+      return true;
+    }
+    if (binary->op == BinaryOp::Sub && isName(*binary->left, assign.name)) {
+      update = {assign.name, binary->right.get(), -1};
+      return true;
+    }
+    return false;
+  }
+
+  int emitBinaryReg(BinaryOp op, int left, int right) {
+    const int result = newReg();
+    IRInst inst{IROp::Binary};
+    inst.dst = result;
+    inst.left = left;
+    inst.right = right;
+    inst.binary = op;
+    emit(std::move(inst));
+    return result;
+  }
+
+  Value lowerNameValue(const std::string& name) {
+    Expr::Name node{name};
+    Expr expr{std::move(node)};
+    return lowerExpr(expr);
+  }
+
+  void emitStoreName(const std::string& name, int reg) {
+    const Symbol* symbol = lookup(name);
+    if (!symbol) fail("assignment to undeclared identifier '" + name + "'");
+    if (symbol->isConst) fail("assignment to constant '" + name + "'");
+    IRInst store{symbol->kind == SymbolKind::Local ? IROp::StoreLocal : IROp::StoreGlobal};
+    store.left = symbol->slot;
+    store.right = reg;
+    store.name = name;
+    emit(std::move(store));
+  }
+
+  bool lowerCountedAccumulationLoop(const Stmt::While& node) {
+    const auto* condition = std::get_if<Expr::Binary>(&node.condition->node);
+    if (!condition || (condition->op != BinaryOp::Lt && condition->op != BinaryOp::Le))
+      return false;
+    const auto* loopName = std::get_if<Expr::Name>(&condition->left->node);
+    int32_t limitValue = 0;
+    if (!loopName || !numberValue(*condition->right, limitValue)) return false;
+    if (condition->op == BinaryOp::Le) {
+      if (limitValue == std::numeric_limits<int32_t>::max()) return false;
+      ++limitValue;
+    }
+
+    std::vector<const Stmt*> items;
+    if (const auto* block = std::get_if<Stmt::Block>(&node.body->node)) {
+      for (const auto& item : block->items) items.push_back(item.get());
+    } else {
+      items.push_back(node.body.get());
+    }
+    if (items.empty()) return false;
+
+    const std::string& counter = loopName->value;
+    int incrementCount = 0;
+    std::vector<AccumulationUpdate> updates;
+    std::unordered_set<std::string> assigned;
+    assigned.insert(counter);
+
+    for (const Stmt* stmt : items) {
+      const auto* assign = std::get_if<Stmt::Assign>(&stmt->node);
+      if (!assign) return false;
+      if (isIncrementByOne(*assign, counter)) {
+        ++incrementCount;
+        continue;
+      }
+      AccumulationUpdate update;
+      if (!parseAccumulationUpdate(*assign, update)) return false;
+      updates.push_back(update);
+      assigned.insert(update.target);
+    }
+
+    if (incrementCount != 1) return false;
+    for (const auto& update : updates) {
+      if (!update.addend || exprHasCall(*update.addend) ||
+          exprReadsAny(*update.addend, assigned))
+        return false;
+    }
+
+    Value counterValue = lowerNameValue(counter);
+    requireInt(counterValue, "while condition");
+    const int limit = emitImm(limitValue);
+    const int conditionReg = emitBinaryReg(BinaryOp::Lt, counterValue.reg, limit);
+    const std::string endLabel = newLabel("counted_loop_end");
+    IRInst skip{IROp::BranchZero};
+    skip.left = conditionReg;
+    skip.name = endLabel;
+    emit(std::move(skip));
+
+    const int iterations = emitBinaryReg(BinaryOp::Sub, limit, counterValue.reg);
+    for (const auto& update : updates) {
+      Value base = lowerNameValue(update.target);
+      Value addend = lowerExpr(*update.addend);
+      requireInt(base, "loop accumulator");
+      requireInt(addend, "loop accumulator");
+      const int delta = emitBinaryReg(BinaryOp::Mul, addend.reg, iterations);
+      const int result = emitBinaryReg(update.sign > 0 ? BinaryOp::Add : BinaryOp::Sub,
+                                      base.reg, delta);
+      emitStoreName(update.target, result);
+    }
+    emitStoreName(counter, limit);
+    IRInst end{IROp::Label};
+    end.name = endLabel;
+    emit(std::move(end));
+    return true;
+  }
+
   static void requireInt(Value value, const std::string& context) {
     if (value.type != Type::Int) fail(context + " requires an int value");
   }
@@ -1337,6 +1540,7 @@ class Lowerer {
         }
         IRInst end{IROp::Label}; end.name = endLabel; emit(std::move(end));
       } else if constexpr (std::is_same_v<T, Stmt::While>) {
+        if (optimize_ && lowerCountedAccumulationLoop(node)) return;
         const std::string conditionLabel = newLabel("while_cond");
         const std::string endLabel = newLabel("while_end");
         IRInst begin{IROp::Label}; begin.name = conditionLabel; emit(std::move(begin));
@@ -1683,6 +1887,25 @@ class RiscVEmitter {
     storeAt(src, "s0", slotOffset(slot));
   }
 
+  static std::optional<int32_t> constantValue(const IRFunction& function, int reg) {
+    for (const auto& inst : function.code) {
+      if (inst.dst == reg) {
+        if (inst.op == IROp::Imm) return inst.imm;
+        return std::nullopt;
+      }
+    }
+    return std::nullopt;
+  }
+
+  static std::optional<int> positivePowerOfTwoShift(int32_t value) {
+    if (value <= 0) return std::nullopt;
+    const uint32_t bits = static_cast<uint32_t>(value);
+    if ((bits & (bits - 1)) != 0) return std::nullopt;
+    int shift = 0;
+    while ((bits >> shift) != 1) ++shift;
+    return shift;
+  }
+
   void emitFunction(const IRFunction& function) {
     const Allocation allocation = allocateRegisters(function);
     allocation_ = &allocation;
@@ -1861,13 +2084,54 @@ class RiscVEmitter {
   }
 
   void emitBinary(const IRFunction& function, const IRInst& inst) {
+    const std::optional<int32_t> leftConst = constantValue(function, inst.left);
+    const std::optional<int32_t> rightConst = constantValue(function, inst.right);
     const std::string left = valueOperand(function, inst.left, "t0");
     const std::string right = valueOperand(function, inst.right, "t1");
     const std::string dst = valueDestination(inst.dst, "t2");
     switch (inst.binary) {
-      case BinaryOp::Add: line("  add " + dst + ", " + left + ", " + right); break;
-      case BinaryOp::Sub: line("  sub " + dst + ", " + left + ", " + right); break;
-      case BinaryOp::Mul: line("  mul " + dst + ", " + left + ", " + right); break;
+      case BinaryOp::Add:
+        if (rightConst && fitsImmediate12(*rightConst)) {
+          line("  addi " + dst + ", " + left + ", " + std::to_string(*rightConst));
+        } else if (leftConst && fitsImmediate12(*leftConst)) {
+          line("  addi " + dst + ", " + right + ", " + std::to_string(*leftConst));
+        } else {
+          line("  add " + dst + ", " + left + ", " + right);
+        }
+        break;
+      case BinaryOp::Sub:
+        if (rightConst) {
+          const int64_t negated = -static_cast<int64_t>(*rightConst);
+          if (negated >= -2048 && negated <= 2047) {
+            line("  addi " + dst + ", " + left + ", " + std::to_string(negated));
+          } else if (leftConst && *leftConst == 0) {
+            line("  neg " + dst + ", " + right);
+          } else {
+            line("  sub " + dst + ", " + left + ", " + right);
+          }
+        } else if (leftConst && *leftConst == 0) {
+          line("  neg " + dst + ", " + right);
+        } else {
+          line("  sub " + dst + ", " + left + ", " + right);
+        }
+        break;
+      case BinaryOp::Mul:
+        if (rightConst) {
+          if (const auto shift = positivePowerOfTwoShift(*rightConst)) {
+            line("  slli " + dst + ", " + left + ", " + std::to_string(*shift));
+          } else {
+            line("  mul " + dst + ", " + left + ", " + right);
+          }
+        } else if (leftConst) {
+          if (const auto shift = positivePowerOfTwoShift(*leftConst)) {
+            line("  slli " + dst + ", " + right + ", " + std::to_string(*shift));
+          } else {
+            line("  mul " + dst + ", " + left + ", " + right);
+          }
+        } else {
+          line("  mul " + dst + ", " + left + ", " + right);
+        }
+        break;
       case BinaryOp::Div: line("  div " + dst + ", " + left + ", " + right); break;
       case BinaryOp::Mod: line("  rem " + dst + ", " + left + ", " + right); break;
       case BinaryOp::Lt: line("  slt " + dst + ", " + left + ", " + right); break;
