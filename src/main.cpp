@@ -1697,6 +1697,11 @@ class RiscVEmitter {
   static std::string savedRegister(int index) {
     return "s" + std::to_string(index + 1);
   }
+  static int savedPhysicalCount() { return 11; }
+  static std::string physicalRegister(int index) {
+    if (index < savedPhysicalCount()) return savedRegister(index);
+    return "t" + std::to_string(index - savedPhysicalCount() + 3);
+  }
 
   static void markUse(std::vector<int>& first, std::vector<int>& last,
                       int reg, int position) {
@@ -1726,7 +1731,15 @@ class RiscVEmitter {
     std::stable_sort(locals.begin(), locals.end(), [&](int left, int right) {
       return localAccesses[left] > localAccesses[right];
     });
-    const int localRegisterCount = std::min(5, function.localCount);
+    bool hasCall = false;
+    for (const auto& inst : function.code) {
+      if (inst.op == IROp::Call) {
+        hasCall = true;
+        break;
+      }
+    }
+    const int physicalCount = savedPhysicalCount() + (hasCall ? 0 : 3);
+    const int localRegisterCount = std::min(function.localCount, std::max(0, physicalCount - 2));
     for (int i = 0; i < localRegisterCount; ++i)
       allocation.localRegisters[locals[i]] = i;
 
@@ -1830,7 +1843,7 @@ class RiscVEmitter {
 
     struct Active { int value; int physical; };
     std::vector<Active> active;
-    std::vector<bool> used(11, false);
+    std::vector<bool> used(physicalCount, false);
     for (int i = 0; i < localRegisterCount; ++i) used[i] = true;
     for (int value : values) {
       for (auto it = active.begin(); it != active.end();) {
@@ -1842,7 +1855,7 @@ class RiscVEmitter {
         }
       }
       int physical = -1;
-      for (int candidate = localRegisterCount; candidate < 11; ++candidate) {
+      for (int candidate = localRegisterCount; candidate < physicalCount; ++candidate) {
         if (!used[candidate]) {
           physical = candidate;
           break;
@@ -1856,9 +1869,15 @@ class RiscVEmitter {
         allocation.spillSlots[value] = allocation.spillCount++;
       }
     }
-    allocation.savedRegisterCount = localRegisterCount;
-    for (int physical : allocation.valueRegisters)
-      allocation.savedRegisterCount = std::max(allocation.savedRegisterCount, physical + 1);
+    allocation.savedRegisterCount = 0;
+    for (int physical : allocation.localRegisters) {
+      if (physical >= 0 && physical < savedPhysicalCount())
+        allocation.savedRegisterCount = std::max(allocation.savedRegisterCount, physical + 1);
+    }
+    for (int physical : allocation.valueRegisters) {
+      if (physical >= 0 && physical < savedPhysicalCount())
+        allocation.savedRegisterCount = std::max(allocation.savedRegisterCount, physical + 1);
+    }
     return allocation;
   }
 
@@ -1893,7 +1912,7 @@ class RiscVEmitter {
     }
     const int physical = allocation_->valueRegisters[reg];
     if (physical >= 0) {
-      const std::string source = savedRegister(physical);
+      const std::string source = physicalRegister(physical);
       if (source != dst) line("  mv " + dst + ", " + source);
       return;
     }
@@ -1903,7 +1922,7 @@ class RiscVEmitter {
   void storeReg(const IRFunction& function, int reg, const std::string& src) {
     const int physical = allocation_->valueRegisters[reg];
     if (physical >= 0) {
-      const std::string destination = savedRegister(physical);
+      const std::string destination = physicalRegister(physical);
       if (destination != src) line("  mv " + destination + ", " + src);
       return;
     }
@@ -1916,12 +1935,12 @@ class RiscVEmitter {
     const int localAlias = allocation_->valueLocalAliases[reg];
     if (localAlias >= 0) {
       const int physical = allocation_->localRegisters[localAlias];
-      if (physical >= 0) return savedRegister(physical);
+      if (physical >= 0) return physicalRegister(physical);
       loadAt(temporary, "s0", slotOffset(localAlias));
       return temporary;
     }
     const int physical = allocation_->valueRegisters[reg];
-    if (physical >= 0) return savedRegister(physical);
+    if (physical >= 0) return physicalRegister(physical);
     const int slot = function.localCount + allocation_->spillSlots[reg];
     loadAt(temporary, "s0", slotOffset(slot));
     return temporary;
@@ -1929,7 +1948,7 @@ class RiscVEmitter {
 
   std::string valueDestination(int reg, const std::string& temporary) const {
     const int physical = allocation_->valueRegisters[reg];
-    return physical >= 0 ? savedRegister(physical) : temporary;
+    return physical >= 0 ? physicalRegister(physical) : temporary;
   }
 
   void finishValue(const IRFunction& function, int reg,
@@ -1941,7 +1960,7 @@ class RiscVEmitter {
   void loadLocal(int slot, const std::string& dst) {
     const int physical = allocation_->localRegisters[slot];
     if (physical >= 0) {
-      const std::string source = savedRegister(physical);
+      const std::string source = physicalRegister(physical);
       if (source != dst) line("  mv " + dst + ", " + source);
       return;
     }
@@ -1950,7 +1969,7 @@ class RiscVEmitter {
   void storeLocal(int slot, const std::string& src) {
     const int physical = allocation_->localRegisters[slot];
     if (physical >= 0) {
-      const std::string destination = savedRegister(physical);
+      const std::string destination = physicalRegister(physical);
       if (destination != src) line("  mv " + destination + ", " + src);
       return;
     }
