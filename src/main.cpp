@@ -594,6 +594,7 @@ class Lowerer {
 
   void lowerFunction(const Function& function) {
     current_ = IRFunction{function.returnType, function.name, function.params};
+    knownLocalValues_.clear();
     scopes_.clear();
     breakLabels_.clear();
     continueLabels_.clear();
@@ -648,7 +649,10 @@ class Lowerer {
     if (const auto found = globals_.find(name); found != globals_.end()) return &found->second;
     return nullptr;
   }
-  int newLocal() { return current_.localCount++; }
+  int newLocal() {
+    knownLocalValues_.push_back(std::nullopt);
+    return current_.localCount++;
+  }
   int newReg() { return nextReg_++; }
   std::string newLabel(const std::string& hint) {
     return ".L" + current_.name + "_" + hint + "_" + std::to_string(nextLabel_++);
@@ -1686,6 +1690,189 @@ class Lowerer {
     store.right = reg;
     store.name = name;
     emit(std::move(store));
+    if (symbol->kind == SymbolKind::Local &&
+        symbol->slot >= 0 && symbol->slot < static_cast<int>(knownLocalValues_.size()))
+      knownLocalValues_[symbol->slot].reset();
+  }
+
+  bool knownLocalValue(const std::string& name, int32_t& value) const {
+    const Symbol* symbol = lookup(name);
+    if (!symbol || symbol->kind != SymbolKind::Local ||
+        symbol->slot < 0 || symbol->slot >= static_cast<int>(knownLocalValues_.size()) ||
+        !knownLocalValues_[symbol->slot])
+      return false;
+    value = *knownLocalValues_[symbol->slot];
+    return true;
+  }
+
+  static bool statementIsContinue(const Stmt& stmt) {
+    if (const auto* block = std::get_if<Stmt::Block>(&stmt.node))
+      return block->items.size() == 1 && statementIsContinue(*block->items.front());
+    return std::holds_alternative<Stmt::Continue>(stmt.node);
+  }
+
+  static bool statementIsBreak(const Stmt& stmt) {
+    if (const auto* block = std::get_if<Stmt::Block>(&stmt.node))
+      return block->items.size() == 1 && statementIsBreak(*block->items.front());
+    return std::holds_alternative<Stmt::Break>(stmt.node);
+  }
+
+  bool parseCounterComparison(const Expr& expr, const std::string& counter,
+                              BinaryOp& op, int32_t& value) {
+    const auto* binary = std::get_if<Expr::Binary>(&expr.node);
+    if (!binary || !isName(*binary->left, counter) ||
+        !constantExprValue(*binary->right, value))
+      return false;
+    op = binary->op;
+    return true;
+  }
+
+  bool lowerFilteredAccumulationLoop(const Stmt::While& node) {
+    const auto* condition = std::get_if<Expr::Binary>(&node.condition->node);
+    if (!condition || (condition->op != BinaryOp::Lt && condition->op != BinaryOp::Le))
+      return false;
+    const auto* loopName = std::get_if<Expr::Name>(&condition->left->node);
+    int32_t boundaryValue = 0;
+    if (!loopName || !constantExprValue(*condition->right, boundaryValue)) return false;
+    int32_t limitValue = boundaryValue;
+    if (condition->op == BinaryOp::Le) {
+      if (limitValue == std::numeric_limits<int32_t>::max()) return false;
+      ++limitValue;
+    }
+
+    const std::string& counter = loopName->value;
+    int32_t startValue = 0;
+    if (!knownLocalValue(counter, startValue) || startValue >= limitValue) return false;
+
+    std::vector<const Stmt*> items;
+    if (const auto* block = std::get_if<Stmt::Block>(&node.body->node)) {
+      for (const auto& item : block->items) items.push_back(item.get());
+    } else {
+      items.push_back(node.body.get());
+    }
+    if (items.empty()) return false;
+
+    int incrementCount = 0;
+    int32_t stepValue = 0;
+    bool seenIncrement = false;
+    std::vector<int32_t> skippedValues;
+    std::optional<int32_t> breakInclusiveLast;
+    std::optional<int32_t> breakExitValue;
+    std::vector<AccumulationUpdate> updates;
+    LoopTemporaries temporaries;
+    std::unordered_set<std::string> assigned;
+    assigned.insert(counter);
+
+    for (const Stmt* stmt : items) {
+      if (const auto* declStmt = std::get_if<Stmt::DeclStmt>(&stmt->node)) {
+        if (declStmt->decl.isConst || !declStmt->decl.init ||
+            temporaries.count(declStmt->decl.name) != 0)
+          return false;
+        temporaries[declStmt->decl.name] = {declStmt->decl.init.get(), seenIncrement};
+        continue;
+      }
+      if (const auto* assign = std::get_if<Stmt::Assign>(&stmt->node)) {
+        if (temporaries.count(assign->name) != 0) return false;
+        int32_t candidateStep = 0;
+        if (parseIncrement(*assign, counter, candidateStep)) {
+          ++incrementCount;
+          stepValue = candidateStep;
+          seenIncrement = true;
+          continue;
+        }
+        AccumulationUpdate update;
+        if (!parseAccumulationUpdate(*assign, update)) return false;
+        update.afterIncrement = seenIncrement;
+        if (!update.afterIncrement) return false;
+        updates.push_back(update);
+        assigned.insert(update.target);
+        continue;
+      }
+      const auto* ifStmt = std::get_if<Stmt::If>(&stmt->node);
+      if (!ifStmt || ifStmt->elseBranch || !seenIncrement) return false;
+      BinaryOp op = BinaryOp::Eq;
+      int32_t value = 0;
+      if (!parseCounterComparison(*ifStmt->condition, counter, op, value)) return false;
+      if (statementIsContinue(*ifStmt->thenBranch) && op == BinaryOp::Eq) {
+        skippedValues.push_back(value);
+      } else if (statementIsBreak(*ifStmt->thenBranch) &&
+                 (op == BinaryOp::Gt || op == BinaryOp::Ge)) {
+        if (breakInclusiveLast) return false;
+        if (op == BinaryOp::Gt) {
+          if (value == std::numeric_limits<int32_t>::max()) return false;
+          breakInclusiveLast = value;
+          breakExitValue = value + 1;
+        } else {
+          if (value == std::numeric_limits<int32_t>::min()) return false;
+          breakInclusiveLast = value - 1;
+          breakExitValue = value;
+        }
+      } else {
+        return false;
+      }
+    }
+
+    if (incrementCount != 1 || stepValue != 1 || updates.empty()) return false;
+    std::unordered_set<std::string> assignedWithoutCounter = assigned;
+    assignedWithoutCounter.erase(counter);
+    std::unordered_set<std::string> temporaryNames;
+    for (const auto& entry : temporaries) temporaryNames.insert(entry.first);
+    for (const auto& [name, temporary] : temporaries) {
+      if (!temporary.value || exprHasCall(*temporary.value) ||
+          exprReadsName(*temporary.value, name) ||
+          exprReadsAny(*temporary.value, assignedWithoutCounter) ||
+          exprReadsAny(*temporary.value, temporaryNames))
+        return false;
+    }
+    for (const auto& update : updates) {
+      if (!update.addend ||
+          !isSupportedLoopAddend(*update.addend, counter, assigned, temporaries,
+                                 update.afterIncrement))
+        return false;
+    }
+
+    int32_t inclusiveLast = limitValue;
+    int32_t finalCounterValue = limitValue;
+    if (breakInclusiveLast && *breakInclusiveLast < inclusiveLast) {
+      inclusiveLast = *breakInclusiveLast;
+      finalCounterValue = *breakExitValue;
+    }
+    if (inclusiveLast <= startValue) return false;
+
+    Value counterValue = lowerNameValue(counter);
+    requireInt(counterValue, "while condition");
+    const int boundary = emitImm(boundaryValue);
+    const int conditionReg = emitBinaryReg(condition->op, counterValue.reg, boundary);
+    const std::string endLabel = newLabel("filtered_loop_end");
+    IRInst skipLoop{IROp::BranchZero};
+    skipLoop.left = conditionReg;
+    skipLoop.name = endLabel;
+    emit(std::move(skipLoop));
+
+    const int one = emitImm(1);
+    const int counterAfterIncrement = emitBinaryReg(BinaryOp::Add, counterValue.reg, one);
+    const int iterations = emitImm(inclusiveLast - startValue);
+    for (const auto& update : updates) {
+      Value base = lowerNameValue(update.target);
+      requireInt(base, "loop accumulator");
+      int delta = emitLoopDelta(*update.addend, counter, assigned, temporaries, true,
+                                counterAfterIncrement, iterations, 1);
+      for (int32_t skipped : skippedValues) {
+        if (skipped <= startValue || skipped > inclusiveLast) continue;
+        const int skipCounter = emitImm(skipped);
+        const int skippedValue = emitLoopPointValue(*update.addend, counter, assigned,
+                                                    temporaries, true, skipCounter);
+        delta = emitBinaryReg(BinaryOp::Sub, delta, skippedValue);
+      }
+      const int result = emitBinaryReg(update.sign > 0 ? BinaryOp::Add : BinaryOp::Sub,
+                                      base.reg, delta);
+      emitStoreName(update.target, result);
+    }
+    emitStoreName(counter, emitImm(finalCounterValue));
+    IRInst end{IROp::Label};
+    end.name = endLabel;
+    emit(std::move(end));
+    return true;
   }
 
   bool lowerCountedAccumulationLoop(const Stmt::While& node) {
@@ -1883,6 +2070,11 @@ class Lowerer {
           declare(node.decl.name, symbol);
           IRInst store{IROp::StoreLocal}; store.left = symbol.slot; store.right = init.reg;
           emit(std::move(store));
+          int32_t known = 0;
+          if (constantExprValue(*node.decl.init, known))
+            knownLocalValues_[symbol.slot] = known;
+          else
+            knownLocalValues_[symbol.slot].reset();
         }
       } else if constexpr (std::is_same_v<T, Stmt::Assign>) {
         const Symbol* symbol = lookup(node.name);
@@ -1895,6 +2087,14 @@ class Lowerer {
         store.right = value.reg;
         store.name = node.name;
         emit(std::move(store));
+        if (symbol->kind == SymbolKind::Local &&
+            symbol->slot >= 0 && symbol->slot < static_cast<int>(knownLocalValues_.size())) {
+          int32_t known = 0;
+          if (constantExprValue(*node.value, known))
+            knownLocalValues_[symbol->slot] = known;
+          else
+            knownLocalValues_[symbol->slot].reset();
+        }
       } else if constexpr (std::is_same_v<T, Stmt::If>) {
         Value condition = lowerExpr(*node.condition);
         requireInt(condition, "if condition");
@@ -1909,8 +2109,11 @@ class Lowerer {
           lowerStmt(*node.elseBranch);
         }
         IRInst end{IROp::Label}; end.name = endLabel; emit(std::move(end));
+        std::fill(knownLocalValues_.begin(), knownLocalValues_.end(), std::nullopt);
       } else if constexpr (std::is_same_v<T, Stmt::While>) {
-        if (optimize_ && lowerCountedAccumulationLoop(node)) return;
+        if (optimize_ &&
+            (lowerFilteredAccumulationLoop(node) ||
+             lowerCountedAccumulationLoop(node))) return;
         const std::string conditionLabel = newLabel("while_cond");
         const std::string endLabel = newLabel("while_end");
         IRInst begin{IROp::Label}; begin.name = conditionLabel; emit(std::move(begin));
@@ -1925,6 +2128,7 @@ class Lowerer {
         breakLabels_.pop_back();
         IRInst jump{IROp::Jump}; jump.name = conditionLabel; emit(std::move(jump));
         IRInst end{IROp::Label}; end.name = endLabel; emit(std::move(end));
+        std::fill(knownLocalValues_.begin(), knownLocalValues_.end(), std::nullopt);
       } else if constexpr (std::is_same_v<T, Stmt::Break>) {
         if (breakLabels_.empty()) fail("break used outside a loop");
         IRInst jump{IROp::Jump}; jump.name = breakLabels_.back(); emit(std::move(jump));
@@ -1952,6 +2156,7 @@ class Lowerer {
   std::unordered_map<std::string, bool> globalNames_;
   std::unordered_map<std::string, FunctionSig> functions_;
   std::vector<std::unordered_map<std::string, Symbol>> scopes_;
+  std::vector<std::optional<int32_t>> knownLocalValues_;
   std::vector<std::string> breakLabels_, continueLabels_;
   IRFunction current_;
   int nextReg_ = 0;
