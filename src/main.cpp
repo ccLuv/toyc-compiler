@@ -2740,12 +2740,175 @@ class Lowerer {
     if (value.type != Type::Int) fail(context + " requires an int value");
   }
 
+  static void collectExprReads(const Expr& expr, std::unordered_set<std::string>& reads) {
+    std::visit([&](const auto& node) {
+      using T = std::decay_t<decltype(node)>;
+      if constexpr (std::is_same_v<T, Expr::Name>) {
+        reads.insert(node.value);
+      } else if constexpr (std::is_same_v<T, Expr::Unary>) {
+        collectExprReads(*node.operand, reads);
+      } else if constexpr (std::is_same_v<T, Expr::Binary>) {
+        collectExprReads(*node.left, reads);
+        collectExprReads(*node.right, reads);
+      } else if constexpr (std::is_same_v<T, Expr::Call>) {
+        for (const auto& arg : node.args) collectExprReads(*arg, reads);
+      }
+    }, expr.node);
+  }
+
+  static void collectStmtReads(const Stmt& stmt, std::unordered_set<std::string>& reads) {
+    std::visit([&](const auto& node) {
+      using T = std::decay_t<decltype(node)>;
+      if constexpr (std::is_same_v<T, Stmt::Block>) {
+        for (const auto& item : node.items) collectStmtReads(*item, reads);
+      } else if constexpr (std::is_same_v<T, Stmt::ExprStmt>) {
+        collectExprReads(*node.expr, reads);
+      } else if constexpr (std::is_same_v<T, Stmt::Assign>) {
+        collectExprReads(*node.value, reads);
+      } else if constexpr (std::is_same_v<T, Stmt::DeclStmt>) {
+        if (node.decl.init) collectExprReads(*node.decl.init, reads);
+      } else if constexpr (std::is_same_v<T, Stmt::If>) {
+        collectExprReads(*node.condition, reads);
+        collectStmtReads(*node.thenBranch, reads);
+        if (node.elseBranch) collectStmtReads(*node.elseBranch, reads);
+      } else if constexpr (std::is_same_v<T, Stmt::While>) {
+        collectExprReads(*node.condition, reads);
+        collectStmtReads(*node.body, reads);
+      } else if constexpr (std::is_same_v<T, Stmt::Return>) {
+        if (node.value) collectExprReads(*node.value, reads);
+      }
+    }, stmt.node);
+  }
+
+  bool collectDroppableLoopEffects(const Stmt& stmt,
+                                   std::unordered_set<std::string>& visibleAssigned,
+                                   std::unordered_set<std::string>& localDecls,
+                                   const std::string& counter,
+                                   int& counterAssignments,
+                                   int32_t& step) {
+    return std::visit([&](const auto& node) -> bool {
+      using T = std::decay_t<decltype(node)>;
+      if constexpr (std::is_same_v<T, Stmt::Block>) {
+        auto scopedDecls = localDecls;
+        for (const auto& item : node.items) {
+          if (!collectDroppableLoopEffects(*item, visibleAssigned, scopedDecls, counter,
+                                           counterAssignments, step))
+            return false;
+        }
+        return true;
+      } else if constexpr (std::is_same_v<T, Stmt::Empty>) {
+        return true;
+      } else if constexpr (std::is_same_v<T, Stmt::ExprStmt>) {
+        return !exprHasCall(*node.expr);
+      } else if constexpr (std::is_same_v<T, Stmt::DeclStmt>) {
+        if (node.decl.init && exprHasCall(*node.decl.init)) return false;
+        localDecls.insert(node.decl.name);
+        return true;
+      } else if constexpr (std::is_same_v<T, Stmt::Assign>) {
+        if (exprHasCall(*node.value)) return false;
+        int32_t candidateStep = 0;
+        if (parseIncrement(node, counter, candidateStep)) {
+          ++counterAssignments;
+          step = candidateStep;
+          if (!localDecls.contains(node.name)) visibleAssigned.insert(node.name);
+          return true;
+        }
+        if (node.name == counter) return false;
+        if (localDecls.contains(node.name)) return true;
+        const Symbol* symbol = lookup(node.name);
+        if (!symbol || symbol->kind != SymbolKind::Local) return false;
+        visibleAssigned.insert(node.name);
+        return true;
+      } else if constexpr (std::is_same_v<T, Stmt::If>) {
+        if (exprHasCall(*node.condition)) return false;
+        const int beforeAssignments = counterAssignments;
+        auto thenDecls = localDecls;
+        if (!collectDroppableLoopEffects(*node.thenBranch, visibleAssigned, thenDecls,
+                                         counter, counterAssignments, step))
+          return false;
+        if (counterAssignments != beforeAssignments) return false;
+        if (node.elseBranch) {
+          auto elseDecls = localDecls;
+          if (!collectDroppableLoopEffects(*node.elseBranch, visibleAssigned, elseDecls,
+                                           counter, counterAssignments, step))
+            return false;
+          if (counterAssignments != beforeAssignments) return false;
+        }
+        return true;
+      } else {
+        return false;
+      }
+    }, stmt.node);
+  }
+
+  bool canSkipSideEffectFreeLoop(const Stmt::While& node,
+                                 const std::unordered_set<std::string>& suffixReads) {
+    const auto* condition = std::get_if<Expr::Binary>(&node.condition->node);
+    if (!condition || (condition->op != BinaryOp::Lt && condition->op != BinaryOp::Le &&
+                       condition->op != BinaryOp::Gt && condition->op != BinaryOp::Ge))
+      return false;
+    const auto* loopName = std::get_if<Expr::Name>(&condition->left->node);
+    int32_t boundaryValue = 0;
+    if (!loopName || !knownValueExpr(*condition->right, boundaryValue)) return false;
+
+    const std::string& counter = loopName->value;
+    int32_t startValue = 0;
+    if (!knownLocalValue(counter, startValue)) return false;
+
+    std::unordered_set<std::string> visibleAssigned;
+    std::unordered_set<std::string> localDecls;
+    int counterAssignments = 0;
+    int32_t step = 0;
+    if (!collectDroppableLoopEffects(*node.body, visibleAssigned, localDecls, counter,
+                                     counterAssignments, step) ||
+        counterAssignments != 1 || step == 0)
+      return false;
+    if (exprReadsAny(*condition->right, visibleAssigned)) return false;
+    for (const auto& name : visibleAssigned) {
+      if (suffixReads.contains(name)) return false;
+    }
+
+    int64_t limit = boundaryValue;
+    if (condition->op == BinaryOp::Le) {
+      if (limit == std::numeric_limits<int32_t>::max()) return false;
+      ++limit;
+    } else if (condition->op == BinaryOp::Ge) {
+      if (limit == std::numeric_limits<int32_t>::min()) return false;
+      --limit;
+    }
+
+    const bool increasing = step > 0;
+    if (increasing && !(condition->op == BinaryOp::Lt || condition->op == BinaryOp::Le))
+      return false;
+    if (!increasing && !(condition->op == BinaryOp::Gt || condition->op == BinaryOp::Ge))
+      return false;
+    const int64_t start = startValue;
+    const bool executes = increasing ? start < limit : start > limit;
+    if (!executes) return true;
+    const int64_t distance = increasing ? limit - start : start - limit;
+    const int64_t absStep = increasing ? step : -static_cast<int64_t>(step);
+    return distance > 0 && absStep > 0 &&
+           (distance + absStep - 1) / absStep <= std::numeric_limits<int32_t>::max();
+  }
+
   void lowerStmt(const Stmt& stmt, bool createScope = true) {
     std::visit([&](const auto& node) {
       using T = std::decay_t<decltype(node)>;
       if constexpr (std::is_same_v<T, Stmt::Block>) {
         if (createScope) pushScope();
-        for (const auto& item : node.items) lowerStmt(*item);
+        std::vector<std::unordered_set<std::string>> suffixReads(node.items.size() + 1);
+        for (size_t i = node.items.size(); i > 0; --i) {
+          suffixReads[i - 1] = suffixReads[i];
+          collectStmtReads(*node.items[i - 1], suffixReads[i - 1]);
+        }
+        for (size_t i = 0; i < node.items.size(); ++i) {
+          if (optimize_) {
+            if (const auto* loop = std::get_if<Stmt::While>(&node.items[i]->node)) {
+              if (canSkipSideEffectFreeLoop(*loop, suffixReads[i + 1])) continue;
+            }
+          }
+          lowerStmt(*node.items[i]);
+        }
         if (createScope) popScope();
       } else if constexpr (std::is_same_v<T, Stmt::Empty>) {
       } else if constexpr (std::is_same_v<T, Stmt::ExprStmt>) {
