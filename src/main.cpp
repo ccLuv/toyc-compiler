@@ -1627,6 +1627,12 @@ class Lowerer {
 
   using LoopTemporaries = std::unordered_map<std::string, LoopTemporary>;
 
+  struct LinearLoopExpr {
+    int counterCoeff = 0;
+    const Expr* offset = nullptr;
+    int offsetSign = 1;
+  };
+
   static const LoopTemporary* loopTemporaryFor(const Expr& expr,
                                                const LoopTemporaries& temporaries) {
     const auto* name = std::get_if<Expr::Name>(&expr.node);
@@ -1652,6 +1658,46 @@ class Lowerer {
         return false;
       }
     }, expr.node);
+  }
+
+  static bool parseLinearLoopExpr(const Expr& expr, const std::string& counter,
+                                  const std::unordered_set<std::string>& assigned,
+                                  const LoopTemporaries& temporaries,
+                                  bool afterIncrement, LinearLoopExpr& result) {
+    if (const auto* temporary = loopTemporaryFor(expr, temporaries)) {
+      if (!temporary->value) return false;
+      if (temporary->afterIncrement != afterIncrement &&
+          exprReadsName(*temporary->value, counter))
+        return false;
+      return parseLinearLoopExpr(*temporary->value, counter, assigned, temporaries,
+                                 afterIncrement, result);
+    }
+    if (isName(expr, counter)) {
+      result = {1, nullptr, 1};
+      return true;
+    }
+    if (exprIsLoopInvariant(expr, assigned)) {
+      result = {0, &expr, 1};
+      return true;
+    }
+    const auto* binary = std::get_if<Expr::Binary>(&expr.node);
+    if (!binary || (binary->op != BinaryOp::Add && binary->op != BinaryOp::Sub))
+      return false;
+    const bool leftCounter = isName(*binary->left, counter);
+    const bool rightCounter = isName(*binary->right, counter);
+    if (leftCounter && exprIsLoopInvariant(*binary->right, assigned)) {
+      result = {1, binary->right.get(), binary->op == BinaryOp::Sub ? -1 : 1};
+      return true;
+    }
+    if (rightCounter && exprIsLoopInvariant(*binary->left, assigned)) {
+      if (binary->op == BinaryOp::Add) {
+        result = {1, binary->left.get(), 1};
+      } else {
+        result = {-1, binary->left.get(), 1};
+      }
+      return true;
+    }
+    return false;
   }
 
   static bool parseAccumulationUpdate(const Stmt::Assign& assign,
@@ -1701,12 +1747,21 @@ class Lowerer {
     if (!binary) return false;
     const bool leftCounter = isName(*binary->left, counter);
     const bool rightCounter = isName(*binary->right, counter);
-    if (binary->op == BinaryOp::Mul)
-      return (leftCounter && exprIsLoopInvariant(*binary->right, assigned)) ||
-             (rightCounter && exprIsLoopInvariant(*binary->left, assigned));
+    if (binary->op == BinaryOp::Mul && leftCounter && rightCounter) return true;
+    if (binary->op == BinaryOp::Mul) {
+      LinearLoopExpr left;
+      LinearLoopExpr right;
+      return parseLinearLoopExpr(*binary->left, counter, assigned, temporaries,
+                                 afterIncrement, left) &&
+             parseLinearLoopExpr(*binary->right, counter, assigned, temporaries,
+                                 afterIncrement, right) &&
+             (left.counterCoeff != 0 || right.counterCoeff != 0);
+    }
     if (binary->op == BinaryOp::Add || binary->op == BinaryOp::Sub)
-      return (leftCounter && exprIsLoopInvariant(*binary->right, assigned)) ||
-             (rightCounter && exprIsLoopInvariant(*binary->left, assigned));
+      return isSupportedLoopAddend(*binary->left, counter, assigned, temporaries,
+                                   afterIncrement) &&
+             isSupportedLoopAddend(*binary->right, counter, assigned, temporaries,
+                                   afterIncrement);
     return false;
   }
 
@@ -1748,6 +1803,75 @@ class Lowerer {
     return emitBinaryReg(BinaryOp::Div, product, two);
   }
 
+  int emitCounterSquareSeries(int counterReg, int iterations, int32_t stepValue) {
+    const int startSquare = emitBinaryReg(BinaryOp::Mul, counterReg, counterReg);
+    const int term0 = emitBinaryReg(BinaryOp::Mul, iterations, startSquare);
+
+    const int one = emitImm(1);
+    const int nMinusOne = emitBinaryReg(BinaryOp::Sub, iterations, one);
+    const int nTimesNMinusOne = emitBinaryReg(BinaryOp::Mul, iterations, nMinusOne);
+    const int two = emitImm(2);
+    const int pairCount = emitBinaryReg(BinaryOp::Div, nTimesNMinusOne, two);
+    const int step = emitImm(stepValue);
+    const int startTimesStep = emitBinaryReg(BinaryOp::Mul, counterReg, step);
+    const int twiceStartStep = emitBinaryReg(BinaryOp::Mul, startTimesStep, two);
+    const int term1 = emitBinaryReg(BinaryOp::Mul, twiceStartStep, pairCount);
+
+    const int twoNMinusOne = emitBinaryReg(BinaryOp::Add, iterations, nMinusOne);
+    const int squareIndexProduct = emitBinaryReg(BinaryOp::Mul, nTimesNMinusOne, twoNMinusOne);
+    const int six = emitImm(6);
+    const int squareIndexSum = emitBinaryReg(BinaryOp::Div, squareIndexProduct, six);
+    const int stepSquare = emitBinaryReg(BinaryOp::Mul, step, step);
+    const int term2 = emitBinaryReg(BinaryOp::Mul, stepSquare, squareIndexSum);
+
+    const int firstTwo = emitBinaryReg(BinaryOp::Add, term0, term1);
+    return emitBinaryReg(BinaryOp::Add, firstTwo, term2);
+  }
+
+  int emitSignedInvariant(const Expr& expr, int sign) {
+    Value value = lowerExpr(expr);
+    requireInt(value, "loop accumulator");
+    if (sign >= 0) return value.reg;
+    const int zero = emitImm(0);
+    return emitBinaryReg(BinaryOp::Sub, zero, value.reg);
+  }
+
+  int emitLinearProductSeries(const LinearLoopExpr& left, const LinearLoopExpr& right,
+                              int counterReg, int iterations, int32_t stepValue) {
+    int total = emitImm(0);
+    auto addTerm = [&](int term) {
+      total = emitBinaryReg(BinaryOp::Add, total, term);
+    };
+    const int squareCoeff = left.counterCoeff * right.counterCoeff;
+    if (squareCoeff != 0) {
+      int term = emitCounterSquareSeries(counterReg, iterations, stepValue);
+      if (squareCoeff < 0) {
+        const int zero = emitImm(0);
+        term = emitBinaryReg(BinaryOp::Sub, zero, term);
+      }
+      addTerm(term);
+    }
+    if (right.offset && left.counterCoeff != 0) {
+      const int offset = emitSignedInvariant(*right.offset,
+                                             left.counterCoeff * right.offsetSign);
+      const int series = emitCounterSeries(counterReg, iterations, stepValue);
+      addTerm(emitBinaryReg(BinaryOp::Mul, offset, series));
+    }
+    if (left.offset && right.counterCoeff != 0) {
+      const int offset = emitSignedInvariant(*left.offset,
+                                             right.counterCoeff * left.offsetSign);
+      const int series = emitCounterSeries(counterReg, iterations, stepValue);
+      addTerm(emitBinaryReg(BinaryOp::Mul, offset, series));
+    }
+    if (left.offset && right.offset) {
+      const int leftOffset = emitSignedInvariant(*left.offset, left.offsetSign);
+      const int rightOffset = emitSignedInvariant(*right.offset, right.offsetSign);
+      const int product = emitBinaryReg(BinaryOp::Mul, leftOffset, rightOffset);
+      addTerm(emitBinaryReg(BinaryOp::Mul, product, iterations));
+    }
+    return total;
+  }
+
   int emitLoopDelta(const Expr& expr, const std::string& counter,
                     const std::unordered_set<std::string>& assigned,
                     const LoopTemporaries& temporaries, bool afterIncrement,
@@ -1773,6 +1897,27 @@ class Lowerer {
     if (!binary) fail("unsupported loop addend");
     const bool leftCounter = isName(*binary->left, counter);
     const bool rightCounter = isName(*binary->right, counter);
+    if (binary->op == BinaryOp::Mul && leftCounter && rightCounter)
+      return emitCounterSquareSeries(counterReg, iterations, stepValue);
+    if (binary->op == BinaryOp::Mul) {
+      LinearLoopExpr left;
+      LinearLoopExpr right;
+      if (parseLinearLoopExpr(*binary->left, counter, assigned, temporaries,
+                              afterIncrement, left) &&
+          parseLinearLoopExpr(*binary->right, counter, assigned, temporaries,
+                              afterIncrement, right) &&
+          (left.counterCoeff != 0 || right.counterCoeff != 0))
+        return emitLinearProductSeries(left, right, counterReg, iterations, stepValue);
+    }
+    if (binary->op == BinaryOp::Add || binary->op == BinaryOp::Sub) {
+      const int leftDelta = emitLoopDelta(*binary->left, counter, assigned, temporaries,
+                                          afterIncrement, counterReg, iterations,
+                                          stepValue);
+      const int rightDelta = emitLoopDelta(*binary->right, counter, assigned, temporaries,
+                                           afterIncrement, counterReg, iterations,
+                                           stepValue);
+      return emitBinaryReg(binary->op, leftDelta, rightDelta);
+    }
     const Expr* invariant = nullptr;
     if (leftCounter && exprIsLoopInvariant(*binary->right, assigned))
       invariant = binary->right.get();
