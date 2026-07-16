@@ -2560,11 +2560,12 @@ class RiscVEmitter {
         break;
       }
     }
-    const int physicalCount = savedPhysicalCount() + (hasCall ? 0 : 3);
+    const int physicalCount = savedPhysicalCount() + 3;
     allocation.savesReturnAddress = hasCall;
     const int valueReserve = hasCall ? 4 : 6;
+    const int localPhysicalLimit = hasCall ? savedPhysicalCount() : physicalCount;
     const int localRegisterCount =
-        std::min(function.localCount, std::max(0, physicalCount - valueReserve));
+        std::min(function.localCount, std::max(0, localPhysicalLimit - valueReserve));
     for (int i = 0; i < localRegisterCount; ++i)
       allocation.localRegisters[locals[i]] = i;
 
@@ -2657,6 +2658,20 @@ class RiscVEmitter {
       }
     }
 
+    std::vector<int> callPositions;
+    if (hasCall) {
+      for (size_t i = 0; i < function.code.size(); ++i)
+        if (function.code[i].op == IROp::Call)
+          callPositions.push_back(static_cast<int>(i));
+    }
+    auto crossesCall = [&](int reg) {
+      if (!hasCall) return false;
+      for (int call : callPositions) {
+        if (first[reg] < call && last[reg] > call) return true;
+      }
+      return false;
+    };
+
     std::vector<int> values;
     for (int reg = 0; reg < function.registerCount; ++reg) {
       if (first[reg] != infinity && allocation.valueLocalAliases[reg] < 0)
@@ -2681,6 +2696,7 @@ class RiscVEmitter {
       }
       int physical = -1;
       for (int candidate = localRegisterCount; candidate < physicalCount; ++candidate) {
+        if (crossesCall(value) && candidate >= savedPhysicalCount()) continue;
         if (!used[candidate]) {
           physical = candidate;
           break;
