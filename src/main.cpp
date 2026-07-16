@@ -1361,6 +1361,48 @@ class Lowerer {
     return ret && ret->value ? ret->value.get() : nullptr;
   }
 
+  static const Stmt::Return* singleReturnStmt(const Stmt& stmt) {
+    if (const auto* ret = std::get_if<Stmt::Return>(&stmt.node))
+      return ret->value ? ret : nullptr;
+    const auto* block = std::get_if<Stmt::Block>(&stmt.node);
+    if (!block || block->items.size() != 1) return nullptr;
+    const auto* ret = std::get_if<Stmt::Return>(&block->items.front()->node);
+    return ret && ret->value ? ret : nullptr;
+  }
+
+  struct InlineIfReturn {
+    const Expr* condition = nullptr;
+    const Expr* thenExpr = nullptr;
+    const Expr* elseExpr = nullptr;
+  };
+
+  static std::optional<InlineIfReturn> inlineableIfReturnBlock(const Function& function) {
+    if (function.returnType != Type::Int) return std::nullopt;
+    const auto* block = std::get_if<Stmt::Block>(&function.body->node);
+    if (!block || block->items.empty() || block->items.size() > 2) return std::nullopt;
+
+    const auto* firstIf = std::get_if<Stmt::If>(&block->items.front()->node);
+    if (!firstIf || !firstIf->condition) return std::nullopt;
+    const auto* thenReturn = singleReturnStmt(*firstIf->thenBranch);
+    if (!thenReturn) return std::nullopt;
+
+    if (firstIf->elseBranch) {
+      const auto* elseReturn = singleReturnStmt(*firstIf->elseBranch);
+      if (!elseReturn) return std::nullopt;
+      if (block->items.size() != 1) return std::nullopt;
+      return InlineIfReturn{firstIf->condition.get(),
+                            thenReturn->value.get(),
+                            elseReturn->value.get()};
+    }
+
+    if (block->items.size() != 2) return std::nullopt;
+    const auto* fallthrough = std::get_if<Stmt::Return>(&block->items.back()->node);
+    if (!fallthrough || !fallthrough->value) return std::nullopt;
+    return InlineIfReturn{firstIf->condition.get(),
+                          thenReturn->value.get(),
+                          fallthrough->value.get()};
+  }
+
   static int exprSize(const Expr& expr) {
     return std::visit([&](const auto& node) -> int {
       using T = std::decay_t<decltype(node)>;
@@ -1411,10 +1453,23 @@ class Lowerer {
     if (body == functionBodies_.end()) return std::nullopt;
     const Function& function = *body->second;
     const Stmt::Block* inlineBlock = inlineableStraightLineBlock(function);
-    if (!inlineBlock) return std::nullopt;
-    const Expr* returned = inlineBlockReturnExpr(*inlineBlock);
-    if (!returned || exprSize(*returned) > 120) return std::nullopt;
-    if (inlineExprHasCall(*returned)) return std::nullopt;
+    const Expr* returned = inlineBlock ? inlineBlockReturnExpr(*inlineBlock) : nullptr;
+    const auto ifReturn = inlineBlock ? std::optional<InlineIfReturn>{}
+                                      : inlineableIfReturnBlock(function);
+    if (!inlineBlock && !ifReturn) return std::nullopt;
+    if (inlineBlock) {
+      if (!returned || exprSize(*returned) > 120) return std::nullopt;
+      if (inlineExprHasCall(*returned)) return std::nullopt;
+    } else {
+      const int totalSize = exprSize(*ifReturn->condition) +
+                            exprSize(*ifReturn->thenExpr) +
+                            exprSize(*ifReturn->elseExpr);
+      if (totalSize > 160) return std::nullopt;
+      if (inlineExprHasCall(*ifReturn->condition) ||
+          inlineExprHasCall(*ifReturn->thenExpr) ||
+          inlineExprHasCall(*ifReturn->elseExpr))
+        return std::nullopt;
+    }
 
     std::vector<Value> args;
     args.reserve(call.args.size());
@@ -1437,11 +1492,59 @@ class Lowerer {
       else
         knownLocalValues_[symbol.slot].reset();
     }
-    for (size_t i = 0; i + 1 < inlineBlock->items.size(); ++i)
-      lowerStmt(*inlineBlock->items[i], false);
-    Value result = lowerExpr(*returned);
+
+    if (inlineBlock) {
+      for (size_t i = 0; i + 1 < inlineBlock->items.size(); ++i)
+        lowerStmt(*inlineBlock->items[i], false);
+      Value result = lowerExpr(*returned);
+      popScope();
+      return result;
+    }
+
+    Value condition = lowerExpr(*ifReturn->condition);
+    requireInt(condition, "if condition");
+    const int resultSlot = newLocal();
+    const std::string elseLabel = newLabel("inline_else");
+    const std::string endLabel = newLabel("inline_end");
+
+    IRInst branch{IROp::BranchZero};
+    branch.left = condition.reg;
+    branch.name = elseLabel;
+    emit(std::move(branch));
+
+    Value thenValue = lowerExpr(*ifReturn->thenExpr);
+    requireInt(thenValue, "inline return");
+    IRInst storeThen{IROp::StoreLocal};
+    storeThen.left = resultSlot;
+    storeThen.right = thenValue.reg;
+    emit(std::move(storeThen));
+
+    IRInst jump{IROp::Jump};
+    jump.name = endLabel;
+    emit(std::move(jump));
+
+    IRInst elseInst{IROp::Label};
+    elseInst.name = elseLabel;
+    emit(std::move(elseInst));
+
+    Value elseValue = lowerExpr(*ifReturn->elseExpr);
+    requireInt(elseValue, "inline return");
+    IRInst storeElse{IROp::StoreLocal};
+    storeElse.left = resultSlot;
+    storeElse.right = elseValue.reg;
+    emit(std::move(storeElse));
+
+    IRInst endInst{IROp::Label};
+    endInst.name = endLabel;
+    emit(std::move(endInst));
+
+    const int resultReg = newReg();
+    IRInst load{IROp::LoadLocal};
+    load.dst = resultReg;
+    load.left = resultSlot;
+    emit(std::move(load));
     popScope();
-    return result;
+    return Value{resultReg, Type::Int};
   }
 
   static bool isName(const Expr& expr, const std::string& name) {
