@@ -2520,9 +2520,16 @@ class RiscVEmitter {
     return "s" + std::to_string(index + 1);
   }
   static int savedPhysicalCount() { return 11; }
+  static int temporaryPhysicalCount() { return 3; }
+  static int argumentPhysicalCount() { return 8; }
+  static int argumentPhysicalStart() {
+    return savedPhysicalCount() + temporaryPhysicalCount();
+  }
   static std::string physicalRegister(int index) {
     if (index < savedPhysicalCount()) return savedRegister(index);
-    return "t" + std::to_string(index - savedPhysicalCount() + 3);
+    if (index < argumentPhysicalStart())
+      return "t" + std::to_string(index - savedPhysicalCount() + 3);
+    return "a" + std::to_string(index - argumentPhysicalStart());
   }
 
   static void markUse(std::vector<int>& first, std::vector<int>& last,
@@ -2560,9 +2567,16 @@ class RiscVEmitter {
         break;
       }
     }
-    const int physicalCount = savedPhysicalCount() + 3;
+    const int physicalCount = savedPhysicalCount() + temporaryPhysicalCount() +
+                              (hasCall ? 0 : argumentPhysicalCount());
     allocation.savesReturnAddress = hasCall;
     std::vector<int> localPool;
+    if (!hasCall) {
+      const int directParams =
+          std::min<int>(function.params.size(), argumentPhysicalCount());
+      for (int param = 0; param < directParams; ++param)
+        allocation.localRegisters[param] = argumentPhysicalStart() + param;
+    }
     if (!hasCall) {
       for (int physical = savedPhysicalCount(); physical < physicalCount; ++physical)
         localPool.push_back(physical);
@@ -2573,8 +2587,30 @@ class RiscVEmitter {
     const int localRegisterCount = std::min(
         function.localCount,
         std::max(0, static_cast<int>(localPool.size()) - valueReserve));
-    for (int i = 0; i < localRegisterCount; ++i)
-      allocation.localRegisters[locals[i]] = localPool[i];
+    int assignedLocals = 0;
+    for (int physical : allocation.localRegisters)
+      if (physical >= 0) ++assignedLocals;
+    for (int local : locals) {
+      if (assignedLocals >= localRegisterCount) break;
+      if (allocation.localRegisters[local] >= 0) continue;
+      int physical = -1;
+      while (!localPool.empty()) {
+        physical = localPool.front();
+        localPool.erase(localPool.begin());
+        bool alreadyUsed = false;
+        for (int assigned : allocation.localRegisters) {
+          if (assigned == physical) {
+            alreadyUsed = true;
+            break;
+          }
+        }
+        if (!alreadyUsed) break;
+        physical = -1;
+      }
+      if (physical < 0) break;
+      allocation.localRegisters[local] = physical;
+      ++assignedLocals;
+    }
 
     const int infinity = std::numeric_limits<int>::max();
     std::vector<int> first(function.registerCount, infinity);
@@ -2706,7 +2742,10 @@ class RiscVEmitter {
       std::vector<int> candidates;
       const bool crosses = crossesCall(value);
       if (!crosses) {
-        for (int candidate = savedPhysicalCount(); candidate < physicalCount; ++candidate)
+        for (int candidate = savedPhysicalCount(); candidate < argumentPhysicalStart() &&
+                                           candidate < physicalCount; ++candidate)
+          candidates.push_back(candidate);
+        for (int candidate = argumentPhysicalStart(); candidate < physicalCount; ++candidate)
           candidates.push_back(candidate);
       }
       for (int candidate = 0; candidate < savedPhysicalCount(); ++candidate)
