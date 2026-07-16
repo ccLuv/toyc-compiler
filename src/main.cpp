@@ -611,10 +611,7 @@ class Lowerer {
     popScope();
     if (optimize_) {
       optimizeTailRecursion();
-      optimizeCurrentFunction();
-      hoistAndDeduplicateConstants();
-      eliminateCopiesAndCommonExpressions();
-      eliminateDeadCode();
+      runOptimizationPipeline();
       rotateLoops();
     }
     current_.registerCount = nextReg_;
@@ -626,10 +623,7 @@ class Lowerer {
     for (auto& function : output_.functions) {
       current_ = std::move(function);
       nextReg_ = current_.registerCount;
-      optimizeCurrentFunction();
-      hoistAndDeduplicateConstants();
-      eliminateCopiesAndCommonExpressions();
-      eliminateDeadCode();
+      runOptimizationPipeline();
       rotateLoops();
       current_.registerCount = nextReg_;
       function = std::move(current_);
@@ -795,6 +789,89 @@ class Lowerer {
         std::fill(localConstants.begin(), localConstants.end(), std::nullopt);
       }
     }
+  }
+
+  void simplifyConstantBranches() {
+    std::unordered_map<int, int32_t> constants;
+    std::vector<IRInst> rewritten;
+    rewritten.reserve(current_.code.size());
+    for (auto& inst : current_.code) {
+      if (inst.op == IROp::Imm) {
+        constants[inst.dst] = inst.imm;
+        rewritten.push_back(std::move(inst));
+      } else if (inst.op == IROp::BranchZero) {
+        const auto value = constants.find(inst.left);
+        if (value == constants.end()) {
+          rewritten.push_back(std::move(inst));
+          continue;
+        }
+        const bool takeBranch = inst.imm != 0 ? value->second != 0 : value->second == 0;
+        if (takeBranch) {
+          IRInst jump{IROp::Jump};
+          jump.name = inst.name;
+          rewritten.push_back(std::move(jump));
+        }
+      } else {
+        if (inst.dst >= 0) constants.erase(inst.dst);
+        if (inst.op == IROp::Label || inst.op == IROp::Jump ||
+            inst.op == IROp::Return)
+          constants.clear();
+        rewritten.push_back(std::move(inst));
+      }
+    }
+    current_.code = std::move(rewritten);
+  }
+
+  void eliminateUnreachableCode() {
+    const size_t count = current_.code.size();
+    if (count == 0) return;
+    std::unordered_map<std::string, size_t> labels;
+    for (size_t i = 0; i < count; ++i) {
+      if (current_.code[i].op == IROp::Label)
+        labels[current_.code[i].name] = i;
+    }
+
+    std::vector<unsigned char> reachable(count);
+    std::vector<size_t> worklist{0};
+    while (!worklist.empty()) {
+      const size_t index = worklist.back();
+      worklist.pop_back();
+      if (index >= count || reachable[index]) continue;
+      reachable[index] = 1;
+      const auto& inst = current_.code[index];
+      auto pushLabel = [&](const std::string& label) {
+        if (const auto found = labels.find(label); found != labels.end())
+          worklist.push_back(found->second);
+      };
+      if (inst.op == IROp::Jump) {
+        pushLabel(inst.name);
+      } else if (inst.op == IROp::BranchZero) {
+        pushLabel(inst.name);
+        worklist.push_back(index + 1);
+      } else if (inst.op != IROp::Return) {
+        worklist.push_back(index + 1);
+      }
+    }
+
+    std::vector<IRInst> kept;
+    kept.reserve(current_.code.size());
+    for (size_t i = 0; i < current_.code.size(); ++i) {
+      if (reachable[i]) kept.push_back(std::move(current_.code[i]));
+    }
+    current_.code = std::move(kept);
+  }
+
+  void runOptimizationPipeline() {
+    for (int round = 0; round < 4; ++round) {
+      optimizeCurrentFunction();
+      simplifyConstantBranches();
+      eliminateUnreachableCode();
+      eliminateCopiesAndCommonExpressions();
+      eliminateDeadCode();
+    }
+    hoistAndDeduplicateConstants();
+    eliminateCopiesAndCommonExpressions();
+    eliminateDeadCode();
   }
 
   void optimizeTailRecursion() {
