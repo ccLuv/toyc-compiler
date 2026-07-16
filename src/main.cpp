@@ -2891,12 +2891,14 @@ class Lowerer {
            (distance + absStep - 1) / absStep <= std::numeric_limits<int32_t>::max();
   }
 
-  void lowerStmt(const Stmt& stmt, bool createScope = true) {
+  void lowerStmt(const Stmt& stmt, bool createScope = true,
+                 const std::unordered_set<std::string>* futureReads = nullptr) {
     std::visit([&](const auto& node) {
       using T = std::decay_t<decltype(node)>;
       if constexpr (std::is_same_v<T, Stmt::Block>) {
         if (createScope) pushScope();
         std::vector<std::unordered_set<std::string>> suffixReads(node.items.size() + 1);
+        if (futureReads) suffixReads.back() = *futureReads;
         for (size_t i = node.items.size(); i > 0; --i) {
           suffixReads[i - 1] = suffixReads[i];
           collectStmtReads(*node.items[i - 1], suffixReads[i - 1]);
@@ -2907,7 +2909,7 @@ class Lowerer {
               if (canSkipSideEffectFreeLoop(*loop, suffixReads[i + 1])) continue;
             }
           }
-          lowerStmt(*node.items[i]);
+          lowerStmt(*node.items[i], true, &suffixReads[i + 1]);
         }
         if (createScope) popScope();
       } else if constexpr (std::is_same_v<T, Stmt::Empty>) {
@@ -2960,11 +2962,11 @@ class Lowerer {
         const std::string endLabel = newLabel("if_end");
         IRInst branch{IROp::BranchZero}; branch.left = condition.reg;
         branch.name = node.elseBranch ? elseLabel : endLabel; emit(std::move(branch));
-        lowerStmt(*node.thenBranch);
+        lowerStmt(*node.thenBranch, true, futureReads);
         if (node.elseBranch) {
           IRInst jump{IROp::Jump}; jump.name = endLabel; emit(std::move(jump));
           IRInst label{IROp::Label}; label.name = elseLabel; emit(std::move(label));
-          lowerStmt(*node.elseBranch);
+          lowerStmt(*node.elseBranch, true, futureReads);
         }
         IRInst end{IROp::Label}; end.name = endLabel; emit(std::move(end));
         std::fill(knownLocalValues_.begin(), knownLocalValues_.end(), std::nullopt);
@@ -2981,7 +2983,12 @@ class Lowerer {
         emit(std::move(branch));
         breakLabels_.push_back(endLabel);
         continueLabels_.push_back(conditionLabel);
-        lowerStmt(*node.body);
+        std::unordered_set<std::string> loopFutureReads;
+        collectExprReads(*node.condition, loopFutureReads);
+        if (futureReads) {
+          loopFutureReads.insert(futureReads->begin(), futureReads->end());
+        }
+        lowerStmt(*node.body, true, &loopFutureReads);
         continueLabels_.pop_back();
         breakLabels_.pop_back();
         IRInst jump{IROp::Jump}; jump.name = conditionLabel; emit(std::move(jump));
