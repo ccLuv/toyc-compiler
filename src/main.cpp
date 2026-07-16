@@ -956,7 +956,6 @@ class Lowerer {
         }
       } else if (inst.op == IROp::StoreLocal) {
         localValues[inst.left] = resolve(inst.right);
-        expressions.clear();
       } else if (inst.op == IROp::Unary && inst.unary == UnaryOp::Plus &&
                  inst.name.empty()) {
         aliases[inst.dst] = resolve(inst.left);
@@ -1723,6 +1722,12 @@ class Lowerer {
     bool afterIncrement = false;
   };
 
+  struct ConditionalAccumulationUpdate {
+    AccumulationUpdate update;
+    const Expr* matchValue = nullptr;
+    bool includeMatch = true;
+  };
+
   struct LoopTemporary {
     const Expr* value = nullptr;
     bool afterIncrement = false;
@@ -1889,6 +1894,39 @@ class Lowerer {
       return true;
     }
     return false;
+  }
+
+  static const Stmt::Assign* singleAssignStmt(const Stmt& stmt) {
+    if (const auto* assign = std::get_if<Stmt::Assign>(&stmt.node))
+      return assign;
+    const auto* block = std::get_if<Stmt::Block>(&stmt.node);
+    if (!block || block->items.size() != 1) return nullptr;
+    return std::get_if<Stmt::Assign>(&block->items.front()->node);
+  }
+
+  static bool parseConditionalAccumulation(const Stmt::If& ifStmt,
+                                           const std::string& counter,
+                                           ConditionalAccumulationUpdate& conditional) {
+    if (ifStmt.elseBranch) return false;
+    const auto* condition = std::get_if<Expr::Binary>(&ifStmt.condition->node);
+    if (!condition || (condition->op != BinaryOp::Eq && condition->op != BinaryOp::Ne))
+      return false;
+    const Expr* matchValue = nullptr;
+    if (isName(*condition->left, counter)) {
+      matchValue = condition->right.get();
+    } else if (isName(*condition->right, counter)) {
+      matchValue = condition->left.get();
+    } else {
+      return false;
+    }
+    const Stmt::Assign* assign = singleAssignStmt(*ifStmt.thenBranch);
+    if (!assign) return false;
+    AccumulationUpdate update;
+    if (!parseAccumulationUpdate(*assign, update)) return false;
+    conditional.update = update;
+    conditional.matchValue = matchValue;
+    conditional.includeMatch = condition->op == BinaryOp::Eq;
+    return true;
   }
 
   int emitBinaryReg(BinaryOp op, int left, int right) {
@@ -2481,6 +2519,7 @@ class Lowerer {
     int incrementCount = 0;
     int32_t stepValue = 0;
     std::vector<AccumulationUpdate> updates;
+    std::vector<ConditionalAccumulationUpdate> conditionalUpdates;
     std::vector<DirectLoopUpdate> directUpdates;
     LoopTemporaries temporaries;
     std::unordered_set<std::string> assigned;
@@ -2493,6 +2532,14 @@ class Lowerer {
             temporaries.count(declStmt->decl.name) != 0)
           return false;
         temporaries[declStmt->decl.name] = {declStmt->decl.init.get(), seenIncrement};
+        continue;
+      }
+      if (const auto* ifStmt = std::get_if<Stmt::If>(&stmt->node)) {
+        ConditionalAccumulationUpdate conditional;
+        if (!parseConditionalAccumulation(*ifStmt, counter, conditional)) return false;
+        conditional.update.afterIncrement = seenIncrement;
+        conditionalUpdates.push_back(conditional);
+        assigned.insert(conditional.update.target);
         continue;
       }
       const auto* assign = std::get_if<Stmt::Assign>(&stmt->node);
@@ -2535,6 +2582,17 @@ class Lowerer {
     }
     for (const auto& update : updates) {
       if (!update.addend ||
+          !isSupportedLoopAddend(*update.addend, counter, assigned, temporaries,
+                                 update.afterIncrement))
+        return false;
+    }
+    if (!conditionalUpdates.empty() && (stepValue != 1 && stepValue != -1))
+      return false;
+    for (const auto& conditional : conditionalUpdates) {
+      const auto& update = conditional.update;
+      if (!conditional.matchValue ||
+          exprReadsAny(*conditional.matchValue, assigned) ||
+          !update.addend ||
           !isSupportedLoopAddend(*update.addend, counter, assigned, temporaries,
                                  update.afterIncrement))
         return false;
@@ -2593,6 +2651,35 @@ class Lowerer {
       const int delta = emitLoopDelta(*update.addend, counter, assigned, temporaries,
                                       update.afterIncrement, seriesStart,
                                       iterations, stepValue);
+      const int result = emitBinaryReg(update.sign > 0 ? BinaryOp::Add : BinaryOp::Sub,
+                                      base.reg, delta);
+      emitStoreName(update.target, result);
+    }
+    for (const auto& conditional : conditionalUpdates) {
+      const auto& update = conditional.update;
+      Value base = lowerNameValue(update.target);
+      requireInt(base, "loop accumulator");
+      const int seriesStart = update.afterIncrement ? counterAfterIncrement : counterValue.reg;
+      Value match = lowerExpr(*conditional.matchValue);
+      requireInt(match, "loop condition");
+      const int lowerOk = stepValue > 0
+                              ? emitBinaryReg(BinaryOp::Ge, match.reg, counterValue.reg)
+                              : emitBinaryReg(BinaryOp::Le, match.reg, counterValue.reg);
+      const int upperOk = stepValue > 0
+                              ? emitBinaryReg(BinaryOp::Lt, match.reg, limit)
+                              : emitBinaryReg(BinaryOp::Gt, match.reg, limit);
+      const int inRange = emitBinaryReg(BinaryOp::Mul, lowerOk, upperOk);
+      const int point = emitLoopPointValue(*update.addend, counter, assigned,
+                                           temporaries, update.afterIncrement,
+                                           match.reg);
+      const int selectedPoint = emitBinaryReg(BinaryOp::Mul, point, inRange);
+      int delta = selectedPoint;
+      if (!conditional.includeMatch) {
+        const int fullDelta = emitLoopDelta(*update.addend, counter, assigned, temporaries,
+                                            update.afterIncrement, seriesStart,
+                                            iterations, stepValue);
+        delta = emitBinaryReg(BinaryOp::Sub, fullDelta, selectedPoint);
+      }
       const int result = emitBinaryReg(update.sign > 0 ? BinaryOp::Add : BinaryOp::Sub,
                                       base.reg, delta);
       emitStoreName(update.target, result);
