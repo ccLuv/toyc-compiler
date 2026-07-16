@@ -2698,24 +2698,16 @@ class RiscVEmitter {
     }
     for (int physical = 0; physical < savedPhysicalCount(); ++physical)
       localPool.push_back(physical);
-    int hotLocalCount = 0;
-    for (int accesses : localAccesses)
-      if (accesses >= 3) ++hotLocalCount;
-    int valueReserve = hasCall ? 5 : 6;
-    if (function.registerCount > 90) valueReserve += 2;
-    if (function.registerCount > 180) valueReserve += 2;
-    const int extraLocalRegisterCount = std::min(
-        hotLocalCount,
+    const int valueReserve = hasCall ? 4 : 5;
+    const int localRegisterCount = std::min(
+        function.localCount,
         std::max(0, static_cast<int>(localPool.size()) - valueReserve));
     int assignedLocals = 0;
     for (int physical : allocation.localRegisters)
       if (physical >= 0) ++assignedLocals;
-    const int localRegisterTarget =
-        std::min(function.localCount, assignedLocals + extraLocalRegisterCount);
     for (int local : locals) {
-      if (assignedLocals >= localRegisterTarget) break;
+      if (assignedLocals >= localRegisterCount) break;
       if (allocation.localRegisters[local] >= 0) continue;
-      if (localAccesses[local] < 3) continue;
       int physical = -1;
       while (!localPool.empty()) {
         physical = localPool.front();
@@ -3256,7 +3248,8 @@ class RiscVEmitter {
             const std::string value = valueOperand(function, inst.left, "t0");
             if (value != "a0") line("  mv a0, " + value);
           }
-          line("  j " + epilogue);
+          if (pc + 1 < function.code.size())
+            line("  j " + epilogue);
           break;
       }
     }
@@ -3425,7 +3418,17 @@ class RiscVEmitter {
         }
         break;
       case BinaryOp::Gt:
-        {
+        if (rightConst && *rightConst != std::numeric_limits<int32_t>::max() &&
+            fitsImmediate12(*rightConst + 1)) {
+          const std::string left = leftOperand();
+          const std::string dst = destination();
+          line("  slti " + dst + ", " + left + ", " + std::to_string(*rightConst + 1));
+          line("  xori " + dst + ", " + dst + ", 1");
+        } else if (leftConst && fitsImmediate12(*leftConst)) {
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  slti " + dst + ", " + right + ", " + std::to_string(*leftConst));
+        } else {
           const std::string left = leftOperand();
           const std::string right = rightOperand();
           const std::string dst = destination();
@@ -3433,7 +3436,17 @@ class RiscVEmitter {
         }
         break;
       case BinaryOp::Le:
-        {
+        if (rightConst && *rightConst != std::numeric_limits<int32_t>::max() &&
+            fitsImmediate12(*rightConst + 1)) {
+          const std::string left = leftOperand();
+          const std::string dst = destination();
+          line("  slti " + dst + ", " + left + ", " + std::to_string(*rightConst + 1));
+        } else if (leftConst && fitsImmediate12(*leftConst)) {
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  slti " + dst + ", " + right + ", " + std::to_string(*leftConst));
+          line("  xori " + dst + ", " + dst + ", 1");
+        } else {
           const std::string left = leftOperand();
           const std::string right = rightOperand();
           const std::string dst = destination();
@@ -3464,6 +3477,16 @@ class RiscVEmitter {
           const std::string right = rightOperand();
           const std::string dst = destination();
           line("  seqz " + dst + ", " + right);
+        } else if (rightConst && fitsImmediate12(*rightConst)) {
+          const std::string left = leftOperand();
+          const std::string dst = destination();
+          line("  xori " + dst + ", " + left + ", " + std::to_string(*rightConst));
+          line("  seqz " + dst + ", " + dst);
+        } else if (leftConst && fitsImmediate12(*leftConst)) {
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  xori " + dst + ", " + right + ", " + std::to_string(*leftConst));
+          line("  seqz " + dst + ", " + dst);
         } else {
           const std::string left = leftOperand();
           const std::string right = rightOperand();
@@ -3481,6 +3504,16 @@ class RiscVEmitter {
           const std::string right = rightOperand();
           const std::string dst = destination();
           line("  snez " + dst + ", " + right);
+        } else if (rightConst && fitsImmediate12(*rightConst)) {
+          const std::string left = leftOperand();
+          const std::string dst = destination();
+          line("  xori " + dst + ", " + left + ", " + std::to_string(*rightConst));
+          line("  snez " + dst + ", " + dst);
+        } else if (leftConst && fitsImmediate12(*leftConst)) {
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  xori " + dst + ", " + right + ", " + std::to_string(*leftConst));
+          line("  snez " + dst + ", " + dst);
         } else {
           const std::string left = leftOperand();
           const std::string right = rightOperand();
