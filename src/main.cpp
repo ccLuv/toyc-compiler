@@ -1439,11 +1439,13 @@ class Lowerer {
     std::string target;
     const Expr* addend = nullptr;
     int sign = 1;
+    bool afterIncrement = false;
   };
 
   struct DirectLoopUpdate {
     std::string target;
     const Expr* value = nullptr;
+    bool afterIncrement = false;
   };
 
   static bool parseAccumulationUpdate(const Stmt::Assign& assign,
@@ -1451,15 +1453,15 @@ class Lowerer {
     const auto* binary = std::get_if<Expr::Binary>(&assign.value->node);
     if (!binary) return false;
     if (binary->op == BinaryOp::Add && isName(*binary->left, assign.name)) {
-      update = {assign.name, binary->right.get(), 1};
+      update = {assign.name, binary->right.get(), 1, false};
       return true;
     }
     if (binary->op == BinaryOp::Add && isName(*binary->right, assign.name)) {
-      update = {assign.name, binary->left.get(), 1};
+      update = {assign.name, binary->left.get(), 1, false};
       return true;
     }
     if (binary->op == BinaryOp::Sub && isName(*binary->left, assign.name)) {
-      update = {assign.name, binary->right.get(), -1};
+      update = {assign.name, binary->right.get(), -1, false};
       return true;
     }
     return false;
@@ -1646,6 +1648,7 @@ class Lowerer {
     std::vector<DirectLoopUpdate> directUpdates;
     std::unordered_set<std::string> assigned;
     assigned.insert(counter);
+    bool seenIncrement = false;
 
     for (const Stmt* stmt : items) {
       const auto* assign = std::get_if<Stmt::Assign>(&stmt->node);
@@ -1654,14 +1657,16 @@ class Lowerer {
       if (parseIncrement(*assign, counter, candidateStep)) {
         ++incrementCount;
         stepValue = candidateStep;
+        seenIncrement = true;
         continue;
       }
       AccumulationUpdate update;
       if (parseAccumulationUpdate(*assign, update)) {
+        update.afterIncrement = seenIncrement;
         updates.push_back(update);
         assigned.insert(update.target);
       } else {
-        directUpdates.push_back({assign->name, assign->value.get()});
+        directUpdates.push_back({assign->name, assign->value.get(), seenIncrement});
         assigned.insert(assign->name);
       }
     }
@@ -1702,25 +1707,41 @@ class Lowerer {
       const int step = emitImm(positiveStep);
       iterations = emitBinaryReg(BinaryOp::Div, biased, step);
     }
+    int counterAfterIncrement = counterValue.reg;
+    if (!updates.empty()) {
+      bool needsAfterIncrement = false;
+      for (const auto& update : updates)
+        needsAfterIncrement = needsAfterIncrement || update.afterIncrement;
+      if (needsAfterIncrement) {
+        const int step = emitImm(stepValue);
+        counterAfterIncrement = emitBinaryReg(BinaryOp::Add, counterValue.reg, step);
+      }
+    }
     for (const auto& update : updates) {
       Value base = lowerNameValue(update.target);
       requireInt(base, "loop accumulator");
-      const int delta = emitLoopDelta(*update.addend, counter, assigned, counterValue.reg,
+      const int seriesStart = update.afterIncrement ? counterAfterIncrement : counterValue.reg;
+      const int delta = emitLoopDelta(*update.addend, counter, assigned, seriesStart,
                                       iterations, stepValue);
       const int result = emitBinaryReg(update.sign > 0 ? BinaryOp::Add : BinaryOp::Sub,
                                       base.reg, delta);
       emitStoreName(update.target, result);
     }
-    int lastCounter = counterValue.reg;
+    int lastCounterBeforeIncrement = counterValue.reg;
+    int lastCounterAfterIncrement = counterValue.reg;
     if (!directUpdates.empty()) {
       const int one = emitImm(1);
       const int lastIndex = emitBinaryReg(BinaryOp::Sub, iterations, one);
       const int step = emitImm(stepValue);
       const int distance = emitBinaryReg(BinaryOp::Mul, lastIndex, step);
-      lastCounter = emitBinaryReg(BinaryOp::Add, counterValue.reg, distance);
+      lastCounterBeforeIncrement = emitBinaryReg(BinaryOp::Add, counterValue.reg, distance);
+      lastCounterAfterIncrement =
+          emitBinaryReg(BinaryOp::Add, lastCounterBeforeIncrement, step);
     }
     for (const auto& update : directUpdates) {
-      const int value = emitLoopPointValue(*update.value, counter, assigned, lastCounter);
+      const int counterAtPoint =
+          update.afterIncrement ? lastCounterAfterIncrement : lastCounterBeforeIncrement;
+      const int value = emitLoopPointValue(*update.value, counter, assigned, counterAtPoint);
       emitStoreName(update.target, value);
     }
     int finalCounter = limit;
