@@ -611,7 +611,10 @@ class Lowerer {
     popScope();
     if (optimize_) {
       optimizeTailRecursion();
-      runOptimizationPipeline();
+      optimizeCurrentFunction();
+      hoistAndDeduplicateConstants();
+      eliminateCopiesAndCommonExpressions();
+      eliminateDeadCode();
       rotateLoops();
     }
     current_.registerCount = nextReg_;
@@ -623,7 +626,10 @@ class Lowerer {
     for (auto& function : output_.functions) {
       current_ = std::move(function);
       nextReg_ = current_.registerCount;
-      runOptimizationPipeline();
+      optimizeCurrentFunction();
+      hoistAndDeduplicateConstants();
+      eliminateCopiesAndCommonExpressions();
+      eliminateDeadCode();
       rotateLoops();
       current_.registerCount = nextReg_;
       function = std::move(current_);
@@ -791,89 +797,6 @@ class Lowerer {
     }
   }
 
-  void simplifyConstantBranches() {
-    std::unordered_map<int, int32_t> constants;
-    std::vector<IRInst> rewritten;
-    rewritten.reserve(current_.code.size());
-    for (auto& inst : current_.code) {
-      if (inst.op == IROp::Imm) {
-        constants[inst.dst] = inst.imm;
-        rewritten.push_back(std::move(inst));
-      } else if (inst.op == IROp::BranchZero) {
-        const auto value = constants.find(inst.left);
-        if (value == constants.end()) {
-          rewritten.push_back(std::move(inst));
-          continue;
-        }
-        const bool takeBranch = inst.imm != 0 ? value->second != 0 : value->second == 0;
-        if (takeBranch) {
-          IRInst jump{IROp::Jump};
-          jump.name = inst.name;
-          rewritten.push_back(std::move(jump));
-        }
-      } else {
-        if (inst.dst >= 0) constants.erase(inst.dst);
-        if (inst.op == IROp::Label || inst.op == IROp::Jump ||
-            inst.op == IROp::Return)
-          constants.clear();
-        rewritten.push_back(std::move(inst));
-      }
-    }
-    current_.code = std::move(rewritten);
-  }
-
-  void eliminateUnreachableCode() {
-    const size_t count = current_.code.size();
-    if (count == 0) return;
-    std::unordered_map<std::string, size_t> labels;
-    for (size_t i = 0; i < count; ++i) {
-      if (current_.code[i].op == IROp::Label)
-        labels[current_.code[i].name] = i;
-    }
-
-    std::vector<unsigned char> reachable(count);
-    std::vector<size_t> worklist{0};
-    while (!worklist.empty()) {
-      const size_t index = worklist.back();
-      worklist.pop_back();
-      if (index >= count || reachable[index]) continue;
-      reachable[index] = 1;
-      const auto& inst = current_.code[index];
-      auto pushLabel = [&](const std::string& label) {
-        if (const auto found = labels.find(label); found != labels.end())
-          worklist.push_back(found->second);
-      };
-      if (inst.op == IROp::Jump) {
-        pushLabel(inst.name);
-      } else if (inst.op == IROp::BranchZero) {
-        pushLabel(inst.name);
-        worklist.push_back(index + 1);
-      } else if (inst.op != IROp::Return) {
-        worklist.push_back(index + 1);
-      }
-    }
-
-    std::vector<IRInst> kept;
-    kept.reserve(current_.code.size());
-    for (size_t i = 0; i < current_.code.size(); ++i) {
-      if (reachable[i]) kept.push_back(std::move(current_.code[i]));
-    }
-    current_.code = std::move(kept);
-  }
-
-  void runOptimizationPipeline() {
-    for (int round = 0; round < 4; ++round) {
-      optimizeCurrentFunction();
-      simplifyConstantBranches();
-      eliminateUnreachableCode();
-      eliminateCopiesAndCommonExpressions();
-      eliminateDeadCode();
-    }
-    hoistAndDeduplicateConstants();
-    eliminateCopiesAndCommonExpressions();
-    eliminateDeadCode();
-  }
-
   void optimizeTailRecursion() {
     std::vector<IRInst> rewritten;
     bool changed = false;
@@ -1033,6 +956,7 @@ class Lowerer {
         }
       } else if (inst.op == IROp::StoreLocal) {
         localValues[inst.left] = resolve(inst.right);
+        expressions.clear();
       } else if (inst.op == IROp::Unary && inst.unary == UnaryOp::Plus &&
                  inst.name.empty()) {
         aliases[inst.dst] = resolve(inst.left);
@@ -2489,7 +2413,18 @@ class Lowerer {
     }
     if (inclusiveLast <= startValue) return false;
 
-    const int counterAfterIncrement = emitImm(startValue + 1);
+    Value counterValue = lowerNameValue(counter);
+    requireInt(counterValue, "while condition");
+    const int boundary = emitImm(boundaryValue);
+    const int conditionReg = emitBinaryReg(condition->op, counterValue.reg, boundary);
+    const std::string endLabel = newLabel("filtered_loop_end");
+    IRInst skipLoop{IROp::BranchZero};
+    skipLoop.left = conditionReg;
+    skipLoop.name = endLabel;
+    emit(std::move(skipLoop));
+
+    const int one = emitImm(1);
+    const int counterAfterIncrement = emitBinaryReg(BinaryOp::Add, counterValue.reg, one);
     const int iterations = emitImm(inclusiveLast - startValue);
     for (const auto& update : updates) {
       Value base = lowerNameValue(update.target);
@@ -2508,6 +2443,9 @@ class Lowerer {
       emitStoreName(update.target, result);
     }
     emitStoreName(counter, emitImm(finalCounterValue));
+    IRInst end{IROp::Label};
+    end.name = endLabel;
+    emit(std::move(end));
     return true;
   }
 
@@ -2608,79 +2546,35 @@ class Lowerer {
         return false;
     }
 
-    const int positiveStep = stepValue > 0 ? stepValue : -stepValue;
-    std::optional<int32_t> constantStart;
-    int32_t startValue = 0;
-    if (knownLocalValue(counter, startValue)) constantStart = startValue;
-
-    std::optional<int32_t> constantLimit;
-    std::optional<int32_t> constantFinalCounter;
-    std::optional<int32_t> constantIterationCount;
-    if (constantBoundary && constantStart) {
-      int64_t limitValue = *constantBoundary;
-      if (condition->op == BinaryOp::Le) {
-        ++limitValue;
-      } else if (condition->op == BinaryOp::Ge) {
-        --limitValue;
-      }
-      const bool executes = stepValue > 0 ? *constantStart < limitValue
-                                          : *constantStart > limitValue;
-      if (!executes) return false;
-      const int64_t distance = stepValue > 0
-                                   ? limitValue - *constantStart
-                                   : static_cast<int64_t>(*constantStart) - limitValue;
-      const int64_t iterationsValue = (distance + positiveStep - 1) / positiveStep;
-      const int64_t finalValue =
-          static_cast<int64_t>(*constantStart) + iterationsValue * stepValue;
-      if (limitValue < std::numeric_limits<int32_t>::min() ||
-          limitValue > std::numeric_limits<int32_t>::max() ||
-          iterationsValue > std::numeric_limits<int32_t>::max() ||
-          finalValue < std::numeric_limits<int32_t>::min() ||
-          finalValue > std::numeric_limits<int32_t>::max())
-        return false;
-      constantLimit = static_cast<int32_t>(limitValue);
-      constantFinalCounter = static_cast<int32_t>(finalValue);
-      constantIterationCount = static_cast<int32_t>(iterationsValue);
+    Value counterValue = lowerNameValue(counter);
+    requireInt(counterValue, "while condition");
+    Value boundaryValueRuntime = lowerExpr(*condition->right);
+    requireInt(boundaryValueRuntime, "while boundary");
+    const int boundary = boundaryValueRuntime.reg;
+    int limit = boundary;
+    if (condition->op == BinaryOp::Le) {
+      const int one = emitImm(1);
+      limit = emitBinaryReg(BinaryOp::Add, boundary, one);
+    } else if (condition->op == BinaryOp::Ge) {
+      const int one = emitImm(1);
+      limit = emitBinaryReg(BinaryOp::Sub, boundary, one);
     }
+    const int conditionReg = emitBinaryReg(condition->op, counterValue.reg, boundary);
+    const std::string endLabel = newLabel("counted_loop_end");
+    IRInst skip{IROp::BranchZero};
+    skip.left = conditionReg;
+    skip.name = endLabel;
+    emit(std::move(skip));
 
-    Value counterValue{0, Type::Int};
-    int limit = 0;
-    int iterations = 0;
-    std::string endLabel;
-    if (constantIterationCount) {
-      counterValue.reg = emitImm(*constantStart);
-      limit = emitImm(*constantLimit);
-      iterations = emitImm(*constantIterationCount);
-    } else {
-      counterValue = lowerNameValue(counter);
-      requireInt(counterValue, "while condition");
-      Value boundaryValueRuntime = lowerExpr(*condition->right);
-      requireInt(boundaryValueRuntime, "while boundary");
-      const int boundary = boundaryValueRuntime.reg;
-      limit = boundary;
-      if (condition->op == BinaryOp::Le) {
-        const int one = emitImm(1);
-        limit = emitBinaryReg(BinaryOp::Add, boundary, one);
-      } else if (condition->op == BinaryOp::Ge) {
-        const int one = emitImm(1);
-        limit = emitBinaryReg(BinaryOp::Sub, boundary, one);
-      }
-      const int conditionReg = emitBinaryReg(condition->op, counterValue.reg, boundary);
-      endLabel = newLabel("counted_loop_end");
-      IRInst skip{IROp::BranchZero};
-      skip.left = conditionReg;
-      skip.name = endLabel;
-      emit(std::move(skip));
-
-      iterations = stepValue > 0
-                       ? emitBinaryReg(BinaryOp::Sub, limit, counterValue.reg)
-                       : emitBinaryReg(BinaryOp::Sub, counterValue.reg, limit);
-      if (positiveStep != 1) {
-        const int bias = emitImm(positiveStep - 1);
-        const int biased = emitBinaryReg(BinaryOp::Add, iterations, bias);
-        const int step = emitImm(positiveStep);
-        iterations = emitBinaryReg(BinaryOp::Div, biased, step);
-      }
+    const int positiveStep = stepValue > 0 ? stepValue : -stepValue;
+    int iterations = stepValue > 0
+                         ? emitBinaryReg(BinaryOp::Sub, limit, counterValue.reg)
+                         : emitBinaryReg(BinaryOp::Sub, counterValue.reg, limit);
+    if (positiveStep != 1) {
+      const int bias = emitImm(positiveStep - 1);
+      const int biased = emitBinaryReg(BinaryOp::Add, iterations, bias);
+      const int step = emitImm(positiveStep);
+      iterations = emitBinaryReg(BinaryOp::Div, biased, step);
     }
     int counterAfterIncrement = counterValue.reg;
     if (!updates.empty()) {
@@ -2721,18 +2615,16 @@ class Lowerer {
                                            update.afterIncrement, counterAtPoint);
       emitStoreName(update.target, value);
     }
-    int finalCounter = constantFinalCounter ? emitImm(*constantFinalCounter) : limit;
-    if (!constantFinalCounter && positiveStep != 1) {
+    int finalCounter = limit;
+    if (positiveStep != 1) {
       const int step = emitImm(stepValue);
       const int distance = emitBinaryReg(BinaryOp::Mul, iterations, step);
       finalCounter = emitBinaryReg(BinaryOp::Add, counterValue.reg, distance);
     }
     emitStoreName(counter, finalCounter);
-    if (!endLabel.empty()) {
-      IRInst end{IROp::Label};
-      end.name = endLabel;
-      emit(std::move(end));
-    }
+    IRInst end{IROp::Label};
+    end.name = endLabel;
+    emit(std::move(end));
     return true;
   }
 
@@ -2740,177 +2632,12 @@ class Lowerer {
     if (value.type != Type::Int) fail(context + " requires an int value");
   }
 
-  static void collectExprReads(const Expr& expr, std::unordered_set<std::string>& reads) {
-    std::visit([&](const auto& node) {
-      using T = std::decay_t<decltype(node)>;
-      if constexpr (std::is_same_v<T, Expr::Name>) {
-        reads.insert(node.value);
-      } else if constexpr (std::is_same_v<T, Expr::Unary>) {
-        collectExprReads(*node.operand, reads);
-      } else if constexpr (std::is_same_v<T, Expr::Binary>) {
-        collectExprReads(*node.left, reads);
-        collectExprReads(*node.right, reads);
-      } else if constexpr (std::is_same_v<T, Expr::Call>) {
-        for (const auto& arg : node.args) collectExprReads(*arg, reads);
-      }
-    }, expr.node);
-  }
-
-  static void collectStmtReads(const Stmt& stmt, std::unordered_set<std::string>& reads) {
-    std::visit([&](const auto& node) {
-      using T = std::decay_t<decltype(node)>;
-      if constexpr (std::is_same_v<T, Stmt::Block>) {
-        for (const auto& item : node.items) collectStmtReads(*item, reads);
-      } else if constexpr (std::is_same_v<T, Stmt::ExprStmt>) {
-        collectExprReads(*node.expr, reads);
-      } else if constexpr (std::is_same_v<T, Stmt::Assign>) {
-        collectExprReads(*node.value, reads);
-      } else if constexpr (std::is_same_v<T, Stmt::DeclStmt>) {
-        if (node.decl.init) collectExprReads(*node.decl.init, reads);
-      } else if constexpr (std::is_same_v<T, Stmt::If>) {
-        collectExprReads(*node.condition, reads);
-        collectStmtReads(*node.thenBranch, reads);
-        if (node.elseBranch) collectStmtReads(*node.elseBranch, reads);
-      } else if constexpr (std::is_same_v<T, Stmt::While>) {
-        collectExprReads(*node.condition, reads);
-        collectStmtReads(*node.body, reads);
-      } else if constexpr (std::is_same_v<T, Stmt::Return>) {
-        if (node.value) collectExprReads(*node.value, reads);
-      }
-    }, stmt.node);
-  }
-
-  bool collectDroppableLoopEffects(const Stmt& stmt,
-                                   std::unordered_set<std::string>& visibleAssigned,
-                                   std::unordered_set<std::string>& localDecls,
-                                   const std::string& counter,
-                                   int& counterAssignments,
-                                   int32_t& step) {
-    return std::visit([&](const auto& node) -> bool {
-      using T = std::decay_t<decltype(node)>;
-      if constexpr (std::is_same_v<T, Stmt::Block>) {
-        auto scopedDecls = localDecls;
-        for (const auto& item : node.items) {
-          if (!collectDroppableLoopEffects(*item, visibleAssigned, scopedDecls, counter,
-                                           counterAssignments, step))
-            return false;
-        }
-        return true;
-      } else if constexpr (std::is_same_v<T, Stmt::Empty>) {
-        return true;
-      } else if constexpr (std::is_same_v<T, Stmt::ExprStmt>) {
-        return !exprHasCall(*node.expr);
-      } else if constexpr (std::is_same_v<T, Stmt::DeclStmt>) {
-        if (node.decl.init && exprHasCall(*node.decl.init)) return false;
-        localDecls.insert(node.decl.name);
-        return true;
-      } else if constexpr (std::is_same_v<T, Stmt::Assign>) {
-        if (exprHasCall(*node.value)) return false;
-        int32_t candidateStep = 0;
-        if (parseIncrement(node, counter, candidateStep)) {
-          ++counterAssignments;
-          step = candidateStep;
-          if (!localDecls.contains(node.name)) visibleAssigned.insert(node.name);
-          return true;
-        }
-        if (node.name == counter) return false;
-        if (localDecls.contains(node.name)) return true;
-        const Symbol* symbol = lookup(node.name);
-        if (!symbol || symbol->kind != SymbolKind::Local) return false;
-        visibleAssigned.insert(node.name);
-        return true;
-      } else if constexpr (std::is_same_v<T, Stmt::If>) {
-        if (exprHasCall(*node.condition)) return false;
-        const int beforeAssignments = counterAssignments;
-        auto thenDecls = localDecls;
-        if (!collectDroppableLoopEffects(*node.thenBranch, visibleAssigned, thenDecls,
-                                         counter, counterAssignments, step))
-          return false;
-        if (counterAssignments != beforeAssignments) return false;
-        if (node.elseBranch) {
-          auto elseDecls = localDecls;
-          if (!collectDroppableLoopEffects(*node.elseBranch, visibleAssigned, elseDecls,
-                                           counter, counterAssignments, step))
-            return false;
-          if (counterAssignments != beforeAssignments) return false;
-        }
-        return true;
-      } else {
-        return false;
-      }
-    }, stmt.node);
-  }
-
-  bool canSkipSideEffectFreeLoop(const Stmt::While& node,
-                                 const std::unordered_set<std::string>& suffixReads) {
-    const auto* condition = std::get_if<Expr::Binary>(&node.condition->node);
-    if (!condition || (condition->op != BinaryOp::Lt && condition->op != BinaryOp::Le &&
-                       condition->op != BinaryOp::Gt && condition->op != BinaryOp::Ge))
-      return false;
-    const auto* loopName = std::get_if<Expr::Name>(&condition->left->node);
-    int32_t boundaryValue = 0;
-    if (!loopName || !knownValueExpr(*condition->right, boundaryValue)) return false;
-
-    const std::string& counter = loopName->value;
-    int32_t startValue = 0;
-    if (!knownLocalValue(counter, startValue)) return false;
-
-    std::unordered_set<std::string> visibleAssigned;
-    std::unordered_set<std::string> localDecls;
-    int counterAssignments = 0;
-    int32_t step = 0;
-    if (!collectDroppableLoopEffects(*node.body, visibleAssigned, localDecls, counter,
-                                     counterAssignments, step) ||
-        counterAssignments != 1 || step == 0)
-      return false;
-    if (exprReadsAny(*condition->right, visibleAssigned)) return false;
-    for (const auto& name : visibleAssigned) {
-      if (suffixReads.contains(name)) return false;
-    }
-
-    int64_t limit = boundaryValue;
-    if (condition->op == BinaryOp::Le) {
-      if (limit == std::numeric_limits<int32_t>::max()) return false;
-      ++limit;
-    } else if (condition->op == BinaryOp::Ge) {
-      if (limit == std::numeric_limits<int32_t>::min()) return false;
-      --limit;
-    }
-
-    const bool increasing = step > 0;
-    if (increasing && !(condition->op == BinaryOp::Lt || condition->op == BinaryOp::Le))
-      return false;
-    if (!increasing && !(condition->op == BinaryOp::Gt || condition->op == BinaryOp::Ge))
-      return false;
-    const int64_t start = startValue;
-    const bool executes = increasing ? start < limit : start > limit;
-    if (!executes) return true;
-    const int64_t distance = increasing ? limit - start : start - limit;
-    const int64_t absStep = increasing ? step : -static_cast<int64_t>(step);
-    return distance > 0 && absStep > 0 &&
-           (distance + absStep - 1) / absStep <= std::numeric_limits<int32_t>::max();
-  }
-
-  void lowerStmt(const Stmt& stmt, bool createScope = true,
-                 const std::unordered_set<std::string>* futureReads = nullptr) {
+  void lowerStmt(const Stmt& stmt, bool createScope = true) {
     std::visit([&](const auto& node) {
       using T = std::decay_t<decltype(node)>;
       if constexpr (std::is_same_v<T, Stmt::Block>) {
         if (createScope) pushScope();
-        std::vector<std::unordered_set<std::string>> suffixReads(node.items.size() + 1);
-        if (futureReads) suffixReads.back() = *futureReads;
-        for (size_t i = node.items.size(); i > 0; --i) {
-          suffixReads[i - 1] = suffixReads[i];
-          collectStmtReads(*node.items[i - 1], suffixReads[i - 1]);
-        }
-        for (size_t i = 0; i < node.items.size(); ++i) {
-          if (optimize_) {
-            if (const auto* loop = std::get_if<Stmt::While>(&node.items[i]->node)) {
-              if (canSkipSideEffectFreeLoop(*loop, suffixReads[i + 1])) continue;
-            }
-          }
-          lowerStmt(*node.items[i], true, &suffixReads[i + 1]);
-        }
+        for (const auto& item : node.items) lowerStmt(*item);
         if (createScope) popScope();
       } else if constexpr (std::is_same_v<T, Stmt::Empty>) {
       } else if constexpr (std::is_same_v<T, Stmt::ExprStmt>) {
@@ -2962,11 +2689,11 @@ class Lowerer {
         const std::string endLabel = newLabel("if_end");
         IRInst branch{IROp::BranchZero}; branch.left = condition.reg;
         branch.name = node.elseBranch ? elseLabel : endLabel; emit(std::move(branch));
-        lowerStmt(*node.thenBranch, true, futureReads);
+        lowerStmt(*node.thenBranch);
         if (node.elseBranch) {
           IRInst jump{IROp::Jump}; jump.name = endLabel; emit(std::move(jump));
           IRInst label{IROp::Label}; label.name = elseLabel; emit(std::move(label));
-          lowerStmt(*node.elseBranch, true, futureReads);
+          lowerStmt(*node.elseBranch);
         }
         IRInst end{IROp::Label}; end.name = endLabel; emit(std::move(end));
         std::fill(knownLocalValues_.begin(), knownLocalValues_.end(), std::nullopt);
@@ -2983,12 +2710,7 @@ class Lowerer {
         emit(std::move(branch));
         breakLabels_.push_back(endLabel);
         continueLabels_.push_back(conditionLabel);
-        std::unordered_set<std::string> loopFutureReads;
-        collectExprReads(*node.condition, loopFutureReads);
-        if (futureReads) {
-          loopFutureReads.insert(futureReads->begin(), futureReads->end());
-        }
-        lowerStmt(*node.body, true, &loopFutureReads);
+        lowerStmt(*node.body);
         continueLabels_.pop_back();
         breakLabels_.pop_back();
         IRInst jump{IROp::Jump}; jump.name = conditionLabel; emit(std::move(jump));
@@ -3054,13 +2776,10 @@ class RiscVEmitter {
  private:
   struct Allocation {
     std::vector<int> localRegisters;
-    std::vector<int> localStackSlots;
     std::vector<int> valueRegisters;
     std::vector<int> valueLocalAliases;
     std::vector<int> spillSlots;
-    std::vector<unsigned char> rematerializedConstants;
     int savedRegisterCount = 0;
-    int localStackCount = 0;
     int spillCount = 0;
     bool savesReturnAddress = true;
   };
@@ -3095,33 +2814,15 @@ class RiscVEmitter {
   Allocation allocateRegisters(const IRFunction& function) const {
     Allocation allocation;
     allocation.localRegisters.assign(function.localCount, -1);
-    allocation.localStackSlots.assign(function.localCount, -1);
     allocation.valueRegisters.assign(function.registerCount, -1);
     allocation.valueLocalAliases.assign(function.registerCount, -1);
     allocation.spillSlots.assign(function.registerCount, -1);
-    allocation.rematerializedConstants.assign(function.registerCount, 0);
-
-    std::vector<int> loopWeights(function.code.size(), 1);
-    std::unordered_map<std::string, size_t> loopLabelPositions;
-    for (size_t i = 0; i < function.code.size(); ++i) {
-      if (function.code[i].op == IROp::Label)
-        loopLabelPositions[function.code[i].name] = i;
-    }
-    for (size_t i = 0; i < function.code.size(); ++i) {
-      const auto& inst = function.code[i];
-      if (inst.op != IROp::Jump && inst.op != IROp::BranchZero) continue;
-      const auto target = loopLabelPositions.find(inst.name);
-      if (target == loopLabelPositions.end() || target->second >= i) continue;
-      for (size_t j = target->second; j <= i; ++j)
-        loopWeights[j] += 10;
-    }
 
     std::vector<int> localAccesses(function.localCount, 0);
-    for (size_t i = 0; i < function.code.size(); ++i) {
-      const auto& inst = function.code[i];
+    for (const auto& inst : function.code) {
       if ((inst.op == IROp::LoadLocal || inst.op == IROp::StoreLocal) &&
           inst.left >= 0) {
-        localAccesses[inst.left] += loopWeights[i];
+        ++localAccesses[inst.left];
       }
       if (inst.op == IROp::LoadLocal && inst.dst >= 0)
         allocation.valueLocalAliases[inst.dst] = inst.left;
@@ -3154,11 +2855,7 @@ class RiscVEmitter {
     }
     for (int physical = 0; physical < savedPhysicalCount(); ++physical)
       localPool.push_back(physical);
-    int hotLocalCount = 0;
-    for (int count : localAccesses) {
-      if (count >= 8) ++hotLocalCount;
-    }
-    const int valueReserve = hasCall ? 6 : (hotLocalCount >= 12 ? 6 : 8);
+    const int valueReserve = hasCall ? 6 : 10;
     const int localRegisterCount = std::min(
         function.localCount,
         std::max(0, static_cast<int>(localPool.size()) - valueReserve));
@@ -3255,11 +2952,6 @@ class RiscVEmitter {
       if (localPhysical >= 0)
         allocation.valueRegisters[store.right] = localPhysical;
     }
-    for (const auto& inst : function.code) {
-      if (inst.op == IROp::Imm && inst.dst >= 0 && inst.imm != 0 &&
-          useCounts[inst.dst] == 1 && allocation.valueRegisters[inst.dst] < 0)
-        allocation.rematerializedConstants[inst.dst] = 1;
-    }
 
     std::unordered_map<std::string, int> labelPositions;
     for (size_t i = 0; i < function.code.size(); ++i) {
@@ -3297,8 +2989,7 @@ class RiscVEmitter {
 
     std::vector<int> values;
     for (int reg = 0; reg < function.registerCount; ++reg) {
-      if (first[reg] != infinity && allocation.valueLocalAliases[reg] < 0 &&
-          !allocation.rematerializedConstants[reg])
+      if (first[reg] != infinity && allocation.valueLocalAliases[reg] < 0)
         if (allocation.valueRegisters[reg] < 0) values.push_back(reg);
     }
     std::stable_sort(values.begin(), values.end(), [&](int left, int right) {
@@ -3373,10 +3064,6 @@ class RiscVEmitter {
       if (physical >= 0 && physical < savedPhysicalCount())
         allocation.savedRegisterCount = std::max(allocation.savedRegisterCount, physical + 1);
     }
-    for (int local = 0; local < function.localCount; ++local) {
-      if (allocation.localRegisters[local] < 0)
-        allocation.localStackSlots[local] = allocation.localStackCount++;
-    }
     return allocation;
   }
 
@@ -3404,7 +3091,6 @@ class RiscVEmitter {
     }
   }
   void loadReg(const IRFunction& function, int reg, const std::string& dst) {
-    (void)function;
     const int localAlias = allocation_->valueLocalAliases[reg];
     if (localAlias >= 0) {
       loadLocal(localAlias, dst);
@@ -3416,40 +3102,36 @@ class RiscVEmitter {
       if (source != dst) line("  mv " + dst + ", " + source);
       return;
     }
-    loadAt(dst, "s0", slotOffset(allocation_->localStackCount + allocation_->spillSlots[reg]));
+    const int slot = function.localCount + allocation_->spillSlots[reg];
+    loadAt(dst, "s0", slotOffset(slot));
   }
   void storeReg(const IRFunction& function, int reg, const std::string& src) {
-    (void)function;
     const int physical = allocation_->valueRegisters[reg];
     if (physical >= 0) {
       const std::string destination = physicalRegister(physical);
       if (destination != src) line("  mv " + destination + ", " + src);
       return;
     }
-    storeAt(src, "s0", slotOffset(allocation_->localStackCount + allocation_->spillSlots[reg]));
+    const int slot = function.localCount + allocation_->spillSlots[reg];
+    storeAt(src, "s0", slotOffset(slot));
   }
 
   std::string valueOperand(const IRFunction& function, int reg,
                            const std::string& temporary) {
-    if (const auto constant = constantValue(function, reg)) {
-      if (*constant == 0) return "x0";
-      if (reg >= 0 &&
-          reg < static_cast<int>(allocation_->rematerializedConstants.size()) &&
-          allocation_->rematerializedConstants[reg]) {
-        line("  li " + temporary + ", " + std::to_string(*constant));
-        return temporary;
-      }
-    }
+    if (const auto constant = constantValue(function, reg);
+        constant && *constant == 0)
+      return "x0";
     const int localAlias = allocation_->valueLocalAliases[reg];
     if (localAlias >= 0) {
       const int physical = allocation_->localRegisters[localAlias];
       if (physical >= 0) return physicalRegister(physical);
-      loadAt(temporary, "s0", slotOffset(allocation_->localStackSlots[localAlias]));
+      loadAt(temporary, "s0", slotOffset(localAlias));
       return temporary;
     }
     const int physical = allocation_->valueRegisters[reg];
     if (physical >= 0) return physicalRegister(physical);
-    loadAt(temporary, "s0", slotOffset(allocation_->localStackCount + allocation_->spillSlots[reg]));
+    const int slot = function.localCount + allocation_->spillSlots[reg];
+    loadAt(temporary, "s0", slotOffset(slot));
     return temporary;
   }
 
@@ -3460,9 +3142,9 @@ class RiscVEmitter {
 
   void finishValue(const IRFunction& function, int reg,
                    const std::string& producedIn) {
-    (void)function;
     if (allocation_->valueRegisters[reg] >= 0) return;
-    storeAt(producedIn, "s0", slotOffset(allocation_->localStackCount + allocation_->spillSlots[reg]));
+    const int slot = function.localCount + allocation_->spillSlots[reg];
+    storeAt(producedIn, "s0", slotOffset(slot));
   }
   void loadLocal(int slot, const std::string& dst) {
     const int physical = allocation_->localRegisters[slot];
@@ -3471,7 +3153,7 @@ class RiscVEmitter {
       if (source != dst) line("  mv " + dst + ", " + source);
       return;
     }
-    loadAt(dst, "s0", slotOffset(allocation_->localStackSlots[slot]));
+    loadAt(dst, "s0", slotOffset(slot));
   }
   void storeLocal(int slot, const std::string& src) {
     const int physical = allocation_->localRegisters[slot];
@@ -3480,7 +3162,7 @@ class RiscVEmitter {
       if (destination != src) line("  mv " + destination + ", " + src);
       return;
     }
-    storeAt(src, "s0", slotOffset(allocation_->localStackSlots[slot]));
+    storeAt(src, "s0", slotOffset(slot));
   }
 
   static std::optional<int32_t> constantValue(const IRFunction& function, int reg) {
@@ -3560,43 +3242,35 @@ class RiscVEmitter {
   void emitFunction(const IRFunction& function) {
     const Allocation allocation = allocateRegisters(function);
     allocation_ = &allocation;
-    const int valueSlots = allocation.localStackCount + allocation.spillCount;
+    const int valueSlots = function.localCount + allocation.spillCount;
     const int outgoingBytes = std::max(0, function.maxCallArgs - 8) * 4;
     const int savedBytes = allocation.savedRegisterCount * 4;
-    const bool usesFrame = allocation.savesReturnAddress ||
-                           allocation.savedRegisterCount > 0 ||
-                           valueSlots > 0 ||
-                           outgoingBytes > 0 ||
-                           function.params.size() > 8;
-    const int frameSize =
-        usesFrame ? align16(8 + savedBytes + valueSlots * 4 + outgoingBytes) : 0;
+    const int frameSize = align16(8 + savedBytes + valueSlots * 4 + outgoingBytes);
     const std::string epilogue = ".L" + function.name + "_return";
 
     line("");
     line("  .globl " + function.name);
     line("  .type " + function.name + ", @function");
     line(function.name + ":");
-    if (usesFrame) {
-      if (fitsImmediate12(-frameSize)) {
-        line("  addi sp, sp, -" + std::to_string(frameSize));
-        if (allocation.savesReturnAddress)
-          line("  sw ra, " + std::to_string(frameSize - 4) + "(sp)");
-        line("  sw s0, " + std::to_string(frameSize - 8) + "(sp)");
-        line("  addi s0, sp, " + std::to_string(frameSize));
-        for (int i = 0; i < allocation.savedRegisterCount; ++i)
-          line("  sw " + savedRegister(i) + ", " +
-               std::to_string(frameSize - 12 - i * 4) + "(sp)");
-      } else {
-        line("  li t0, " + std::to_string(frameSize));
-        line("  sub sp, sp, t0");
-        line("  add t6, sp, t0");
-        if (allocation.savesReturnAddress) line("  sw ra, -4(t6)");
-        line("  sw s0, -8(t6)");
-        line("  mv s0, t6");
-        for (int i = 0; i < allocation.savedRegisterCount; ++i)
-          line("  sw " + savedRegister(i) + ", " +
-               std::to_string(-12 - i * 4) + "(s0)");
-      }
+    if (fitsImmediate12(-frameSize)) {
+      line("  addi sp, sp, -" + std::to_string(frameSize));
+      if (allocation.savesReturnAddress)
+        line("  sw ra, " + std::to_string(frameSize - 4) + "(sp)");
+      line("  sw s0, " + std::to_string(frameSize - 8) + "(sp)");
+      line("  addi s0, sp, " + std::to_string(frameSize));
+      for (int i = 0; i < allocation.savedRegisterCount; ++i)
+        line("  sw " + savedRegister(i) + ", " +
+             std::to_string(frameSize - 12 - i * 4) + "(sp)");
+    } else {
+      line("  li t0, " + std::to_string(frameSize));
+      line("  sub sp, sp, t0");
+      line("  add t6, sp, t0");
+      if (allocation.savesReturnAddress) line("  sw ra, -4(t6)");
+      line("  sw s0, -8(t6)");
+      line("  mv s0, t6");
+      for (int i = 0; i < allocation.savedRegisterCount; ++i)
+        line("  sw " + savedRegister(i) + ", " +
+             std::to_string(-12 - i * 4) + "(s0)");
     }
     for (size_t i = 0; i < function.params.size(); ++i) {
       if (i < 8) {
@@ -3669,10 +3343,6 @@ class RiscVEmitter {
       switch (inst.op) {
         case IROp::Imm:
           {
-            if (inst.dst >= 0 &&
-                inst.dst < static_cast<int>(allocation.rematerializedConstants.size()) &&
-                allocation.rematerializedConstants[inst.dst])
-              break;
             const std::string dst = valueDestination(inst.dst, "t0");
             line("  li " + dst + ", " + std::to_string(inst.imm));
             finishValue(function, inst.dst, dst);
@@ -3682,18 +3352,7 @@ class RiscVEmitter {
           // The virtual value aliases the local's storage until its only use.
           break;
         case IROp::StoreLocal:
-          if (const auto constant = constantValue(function, inst.right);
-              constant && inst.left >= 0 &&
-              allocation.localRegisters[inst.left] >= 0) {
-            const std::string destination =
-                physicalRegister(allocation.localRegisters[inst.left]);
-            if (*constant == 0)
-              line("  mv " + destination + ", x0");
-            else
-              line("  li " + destination + ", " + std::to_string(*constant));
-          } else {
-            storeLocal(inst.left, valueOperand(function, inst.right, "t0"));
-          }
+          storeLocal(inst.left, valueOperand(function, inst.right, "t0"));
           break;
         case IROp::LoadGlobal:
           {
@@ -3743,15 +3402,8 @@ class RiscVEmitter {
           break;
         case IROp::Return:
           if (inst.left >= 0) {
-            if (const auto constant = constantValue(function, inst.left)) {
-              if (*constant == 0)
-                line("  mv a0, x0");
-              else
-                line("  li a0, " + std::to_string(*constant));
-            } else {
-              const std::string value = valueOperand(function, inst.left, "t0");
-              if (value != "a0") line("  mv a0, " + value);
-            }
+            const std::string value = valueOperand(function, inst.left, "t0");
+            if (value != "a0") line("  mv a0, " + value);
           }
           if (pc + 1 < function.code.size())
             line("  j " + epilogue);
@@ -3759,14 +3411,12 @@ class RiscVEmitter {
       }
     }
     line(epilogue + ":");
-    if (usesFrame) {
-      for (int i = 0; i < allocation.savedRegisterCount; ++i)
-        loadAt(savedRegister(i), "s0", -12 - i * 4);
-      if (allocation.savesReturnAddress) line("  lw ra, -4(s0)");
-      line("  lw t0, -8(s0)");
-      line("  mv sp, s0");
-      line("  mv s0, t0");
-    }
+    for (int i = 0; i < allocation.savedRegisterCount; ++i)
+      loadAt(savedRegister(i), "s0", -12 - i * 4);
+    if (allocation.savesReturnAddress) line("  lw ra, -4(s0)");
+    line("  lw t0, -8(s0)");
+    line("  mv sp, s0");
+    line("  mv s0, t0");
     line("  ret");
     line("  .size " + function.name + ", .-" + function.name);
     allocation_ = nullptr;
