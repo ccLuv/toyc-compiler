@@ -1733,7 +1733,8 @@ class Lowerer {
   struct LinearLoopExpr {
     int counterCoeff = 0;
     const Expr* offset = nullptr;
-    int offsetSign = 1;
+    int offsetCoeff = 0;
+    int32_t constantOffset = 0;
   };
 
   static const LoopTemporary* loopTemporaryFor(const Expr& expr,
@@ -1776,15 +1777,83 @@ class Lowerer {
                                  afterIncrement, result);
     }
     if (isName(expr, counter)) {
-      result = {1, nullptr, 1};
+      result = {1, nullptr, 0, 0};
       return true;
     }
     if (exprIsLoopInvariant(expr, assigned)) {
-      result = {0, &expr, 1};
+      int32_t constant = 0;
+      if (numberValue(expr, constant))
+        result = {0, nullptr, 0, constant};
+      else
+        result = {0, &expr, 1, 0};
       return true;
     }
     const auto* binary = std::get_if<Expr::Binary>(&expr.node);
-    if (!binary || (binary->op != BinaryOp::Add && binary->op != BinaryOp::Sub))
+    if (!binary)
+      return false;
+    if (binary->op == BinaryOp::Mul) {
+      int32_t constant = 0;
+      const Expr* term = nullptr;
+      if (numberValue(*binary->left, constant)) {
+        term = binary->right.get();
+      } else if (numberValue(*binary->right, constant)) {
+        term = binary->left.get();
+      } else {
+        return false;
+      }
+      LinearLoopExpr inner;
+      if (!parseLinearLoopExpr(*term, counter, assigned, temporaries,
+                               afterIncrement, inner))
+        return false;
+      const int64_t scaledCounter =
+          static_cast<int64_t>(inner.counterCoeff) * constant;
+      const int64_t scaledOffset =
+          static_cast<int64_t>(inner.offsetCoeff) * constant;
+      const int64_t scaledConstant =
+          static_cast<int64_t>(inner.constantOffset) * constant;
+      if (scaledCounter < std::numeric_limits<int>::min() ||
+          scaledCounter > std::numeric_limits<int>::max() ||
+          scaledOffset < std::numeric_limits<int>::min() ||
+          scaledOffset > std::numeric_limits<int>::max() ||
+          scaledConstant < std::numeric_limits<int32_t>::min() ||
+          scaledConstant > std::numeric_limits<int32_t>::max())
+        return false;
+      result = {static_cast<int>(scaledCounter), inner.offset,
+                static_cast<int>(scaledOffset), static_cast<int32_t>(scaledConstant)};
+      return true;
+    }
+    if (binary->op == BinaryOp::Add || binary->op == BinaryOp::Sub) {
+      LinearLoopExpr left;
+      LinearLoopExpr right;
+      const bool leftLinear = parseLinearLoopExpr(*binary->left, counter, assigned,
+                                                  temporaries, afterIncrement, left);
+      const bool rightLinear = parseLinearLoopExpr(*binary->right, counter, assigned,
+                                                   temporaries, afterIncrement, right);
+      if (leftLinear && rightLinear) {
+        const int sign = binary->op == BinaryOp::Sub ? -1 : 1;
+        if (left.offset && right.offset && left.offset != right.offset) return false;
+        const int64_t coeff =
+            static_cast<int64_t>(left.counterCoeff) + sign * right.counterCoeff;
+        const int64_t offsetCoeff =
+            static_cast<int64_t>(left.offsetCoeff) + sign * right.offsetCoeff;
+        const int64_t constantOffset =
+            static_cast<int64_t>(left.constantOffset) + sign * right.constantOffset;
+        if (coeff < std::numeric_limits<int>::min() ||
+            coeff > std::numeric_limits<int>::max() ||
+            offsetCoeff < std::numeric_limits<int>::min() ||
+            offsetCoeff > std::numeric_limits<int>::max() ||
+            constantOffset < std::numeric_limits<int32_t>::min() ||
+            constantOffset > std::numeric_limits<int32_t>::max())
+          return false;
+        result.counterCoeff = static_cast<int>(coeff);
+        result.offset = left.offset ? left.offset : right.offset;
+        result.offsetCoeff = static_cast<int>(offsetCoeff);
+        result.constantOffset = static_cast<int32_t>(constantOffset);
+        return result.counterCoeff != 0 || result.offset != nullptr ||
+               result.constantOffset != 0;
+      }
+    }
+    if (binary->op != BinaryOp::Add && binary->op != BinaryOp::Sub)
       return false;
     const bool leftCounter = isName(*binary->left, counter);
     const bool rightCounter = isName(*binary->right, counter);
@@ -1846,6 +1915,11 @@ class Lowerer {
                                    afterIncrement);
     }
     if (exprIsLoopInvariant(expr, assigned) || isName(expr, counter)) return true;
+    LinearLoopExpr linear;
+    if (parseLinearLoopExpr(expr, counter, assigned, temporaries, afterIncrement,
+                            linear) &&
+        linear.counterCoeff != 0)
+      return true;
     const auto* binary = std::get_if<Expr::Binary>(&expr.node);
     if (!binary) return false;
     const bool leftCounter = isName(*binary->left, counter);
@@ -1881,6 +1955,11 @@ class Lowerer {
                                       afterIncrement);
     }
     if (exprIsLoopInvariant(expr, assigned) || isName(expr, counter)) return true;
+    LinearLoopExpr linear;
+    if (parseLinearLoopExpr(expr, counter, assigned, temporaries, afterIncrement,
+                            linear) &&
+        linear.counterCoeff != 0)
+      return true;
     const auto* binary = std::get_if<Expr::Binary>(&expr.node);
     if (!binary) return false;
     const bool leftCounter = isName(*binary->left, counter);
@@ -1931,12 +2010,21 @@ class Lowerer {
     return emitBinaryReg(BinaryOp::Add, firstTwo, term2);
   }
 
-  int emitSignedInvariant(const Expr& expr, int sign) {
+  int emitScaledReg(int reg, int coeff) {
+    if (coeff == 0) return emitImm(0);
+    if (coeff == 1) return reg;
+    if (coeff == -1) {
+      const int zero = emitImm(0);
+      return emitBinaryReg(BinaryOp::Sub, zero, reg);
+    }
+    const int multiplier = emitImm(coeff);
+    return emitBinaryReg(BinaryOp::Mul, reg, multiplier);
+  }
+
+  int emitScaledInvariant(const Expr& expr, int coeff) {
     Value value = lowerExpr(expr);
     requireInt(value, "loop accumulator");
-    if (sign >= 0) return value.reg;
-    const int zero = emitImm(0);
-    return emitBinaryReg(BinaryOp::Sub, zero, value.reg);
+    return emitScaledReg(value.reg, coeff);
   }
 
   int emitLinearProductSeries(const LinearLoopExpr& left, const LinearLoopExpr& right,
@@ -1945,32 +2033,85 @@ class Lowerer {
     auto addTerm = [&](int term) {
       total = emitBinaryReg(BinaryOp::Add, total, term);
     };
-    const int squareCoeff = left.counterCoeff * right.counterCoeff;
+    const int64_t squareCoeff64 =
+        static_cast<int64_t>(left.counterCoeff) * right.counterCoeff;
+    if (squareCoeff64 < std::numeric_limits<int>::min() ||
+        squareCoeff64 > std::numeric_limits<int>::max())
+      fail("unsupported loop coefficient");
+    const int squareCoeff = static_cast<int>(squareCoeff64);
     if (squareCoeff != 0) {
       int term = emitCounterSquareSeries(counterReg, iterations, stepValue);
-      if (squareCoeff < 0) {
-        const int zero = emitImm(0);
-        term = emitBinaryReg(BinaryOp::Sub, zero, term);
-      }
+      term = emitScaledReg(term, squareCoeff);
       addTerm(term);
     }
     if (right.offset && left.counterCoeff != 0) {
-      const int offset = emitSignedInvariant(*right.offset,
-                                             left.counterCoeff * right.offsetSign);
+      const int64_t coeff =
+          static_cast<int64_t>(left.counterCoeff) * right.offsetCoeff;
+      if (coeff < std::numeric_limits<int>::min() ||
+          coeff > std::numeric_limits<int>::max())
+        fail("unsupported loop coefficient");
+      const int offset = emitScaledInvariant(*right.offset, static_cast<int>(coeff));
       const int series = emitCounterSeries(counterReg, iterations, stepValue);
       addTerm(emitBinaryReg(BinaryOp::Mul, offset, series));
+    }
+    if (right.constantOffset != 0 && left.counterCoeff != 0) {
+      const int64_t coeff =
+          static_cast<int64_t>(left.counterCoeff) * right.constantOffset;
+      if (coeff < std::numeric_limits<int>::min() ||
+          coeff > std::numeric_limits<int>::max())
+        fail("unsupported loop coefficient");
+      const int scaledSeries =
+          emitScaledReg(emitCounterSeries(counterReg, iterations, stepValue),
+                        static_cast<int>(coeff));
+      addTerm(scaledSeries);
     }
     if (left.offset && right.counterCoeff != 0) {
-      const int offset = emitSignedInvariant(*left.offset,
-                                             right.counterCoeff * left.offsetSign);
+      const int64_t coeff =
+          static_cast<int64_t>(right.counterCoeff) * left.offsetCoeff;
+      if (coeff < std::numeric_limits<int>::min() ||
+          coeff > std::numeric_limits<int>::max())
+        fail("unsupported loop coefficient");
+      const int offset = emitScaledInvariant(*left.offset, static_cast<int>(coeff));
       const int series = emitCounterSeries(counterReg, iterations, stepValue);
       addTerm(emitBinaryReg(BinaryOp::Mul, offset, series));
     }
+    if (left.constantOffset != 0 && right.counterCoeff != 0) {
+      const int64_t coeff =
+          static_cast<int64_t>(right.counterCoeff) * left.constantOffset;
+      if (coeff < std::numeric_limits<int>::min() ||
+          coeff > std::numeric_limits<int>::max())
+        fail("unsupported loop coefficient");
+      const int scaledSeries =
+          emitScaledReg(emitCounterSeries(counterReg, iterations, stepValue),
+                        static_cast<int>(coeff));
+      addTerm(scaledSeries);
+    }
     if (left.offset && right.offset) {
-      const int leftOffset = emitSignedInvariant(*left.offset, left.offsetSign);
-      const int rightOffset = emitSignedInvariant(*right.offset, right.offsetSign);
+      const int leftOffset = emitScaledInvariant(*left.offset, left.offsetCoeff);
+      const int rightOffset = emitScaledInvariant(*right.offset, right.offsetCoeff);
       const int product = emitBinaryReg(BinaryOp::Mul, leftOffset, rightOffset);
       addTerm(emitBinaryReg(BinaryOp::Mul, product, iterations));
+    }
+    if (left.offset && right.constantOffset != 0) {
+      const int offset = emitScaledInvariant(*left.offset, left.offsetCoeff);
+      const int constant = emitImm(right.constantOffset);
+      const int product = emitBinaryReg(BinaryOp::Mul, offset, constant);
+      addTerm(emitBinaryReg(BinaryOp::Mul, product, iterations));
+    }
+    if (right.offset && left.constantOffset != 0) {
+      const int offset = emitScaledInvariant(*right.offset, right.offsetCoeff);
+      const int constant = emitImm(left.constantOffset);
+      const int product = emitBinaryReg(BinaryOp::Mul, offset, constant);
+      addTerm(emitBinaryReg(BinaryOp::Mul, product, iterations));
+    }
+    if (left.constantOffset != 0 && right.constantOffset != 0) {
+      const int64_t product =
+          static_cast<int64_t>(left.constantOffset) * right.constantOffset;
+      if (product < std::numeric_limits<int>::min() ||
+          product > std::numeric_limits<int>::max())
+        fail("unsupported loop coefficient");
+      const int constant = emitImm(static_cast<int>(product));
+      addTerm(emitBinaryReg(BinaryOp::Mul, constant, iterations));
     }
     return total;
   }
@@ -2064,6 +2205,22 @@ class Lowerer {
       return value.reg;
     }
     if (isName(expr, counter)) return counterAtPoint;
+
+    LinearLoopExpr linear;
+    if (parseLinearLoopExpr(expr, counter, assigned, temporaries, afterIncrement,
+                            linear) &&
+        linear.counterCoeff != 0) {
+      int result = emitScaledReg(counterAtPoint, linear.counterCoeff);
+      if (linear.offset) {
+        const int offset = emitScaledInvariant(*linear.offset, linear.offsetCoeff);
+        result = emitBinaryReg(BinaryOp::Add, result, offset);
+      }
+      if (linear.constantOffset != 0) {
+        const int offset = emitImm(linear.constantOffset);
+        result = emitBinaryReg(BinaryOp::Add, result, offset);
+      }
+      return result;
+    }
 
     const auto* binary = std::get_if<Expr::Binary>(&expr.node);
     if (!binary) fail("unsupported loop assignment");
@@ -2698,7 +2855,7 @@ class RiscVEmitter {
     }
     for (int physical = 0; physical < savedPhysicalCount(); ++physical)
       localPool.push_back(physical);
-    const int valueReserve = hasCall ? 4 : 5;
+    const int valueReserve = hasCall ? 6 : 10;
     const int localRegisterCount = std::min(
         function.localCount,
         std::max(0, static_cast<int>(localPool.size()) - valueReserve));
