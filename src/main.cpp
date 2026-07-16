@@ -1448,6 +1448,40 @@ class Lowerer {
     bool afterIncrement = false;
   };
 
+  struct LoopTemporary {
+    const Expr* value = nullptr;
+    bool afterIncrement = false;
+  };
+
+  using LoopTemporaries = std::unordered_map<std::string, LoopTemporary>;
+
+  static const LoopTemporary* loopTemporaryFor(const Expr& expr,
+                                               const LoopTemporaries& temporaries) {
+    const auto* name = std::get_if<Expr::Name>(&expr.node);
+    if (!name) return nullptr;
+    const auto found = temporaries.find(name->value);
+    return found == temporaries.end() ? nullptr : &found->second;
+  }
+
+  static bool exprReadsName(const Expr& expr, const std::string& name) {
+    return std::visit([&](const auto& node) -> bool {
+      using T = std::decay_t<decltype(node)>;
+      if constexpr (std::is_same_v<T, Expr::Name>) {
+        return node.value == name;
+      } else if constexpr (std::is_same_v<T, Expr::Unary>) {
+        return exprReadsName(*node.operand, name);
+      } else if constexpr (std::is_same_v<T, Expr::Binary>) {
+        return exprReadsName(*node.left, name) || exprReadsName(*node.right, name);
+      } else if constexpr (std::is_same_v<T, Expr::Call>) {
+        for (const auto& arg : node.args)
+          if (exprReadsName(*arg, name)) return true;
+        return false;
+      } else {
+        return false;
+      }
+    }, expr.node);
+  }
+
   static bool parseAccumulationUpdate(const Stmt::Assign& assign,
                                       AccumulationUpdate& update) {
     const auto* binary = std::get_if<Expr::Binary>(&assign.value->node);
@@ -1479,7 +1513,17 @@ class Lowerer {
   }
 
   static bool isSupportedLoopAddend(const Expr& expr, const std::string& counter,
-                                    const std::unordered_set<std::string>& assigned) {
+                                    const std::unordered_set<std::string>& assigned,
+                                    const LoopTemporaries& temporaries,
+                                    bool afterIncrement) {
+    if (const auto* temporary = loopTemporaryFor(expr, temporaries)) {
+      if (!temporary->value) return false;
+      if (temporary->afterIncrement != afterIncrement &&
+          exprReadsName(*temporary->value, counter))
+        return false;
+      return isSupportedLoopAddend(*temporary->value, counter, assigned, temporaries,
+                                   afterIncrement);
+    }
     if (exprIsLoopInvariant(expr, assigned) || isName(expr, counter)) return true;
     const auto* binary = std::get_if<Expr::Binary>(&expr.node);
     if (!binary) return false;
@@ -1495,7 +1539,17 @@ class Lowerer {
   }
 
   static bool isSupportedLoopPointExpr(const Expr& expr, const std::string& counter,
-                                       const std::unordered_set<std::string>& assigned) {
+                                       const std::unordered_set<std::string>& assigned,
+                                       const LoopTemporaries& temporaries,
+                                       bool afterIncrement) {
+    if (const auto* temporary = loopTemporaryFor(expr, temporaries)) {
+      if (!temporary->value) return false;
+      if (temporary->afterIncrement != afterIncrement &&
+          exprReadsName(*temporary->value, counter))
+        return false;
+      return isSupportedLoopPointExpr(*temporary->value, counter, assigned, temporaries,
+                                      afterIncrement);
+    }
     if (exprIsLoopInvariant(expr, assigned) || isName(expr, counter)) return true;
     const auto* binary = std::get_if<Expr::Binary>(&expr.node);
     if (!binary) return false;
@@ -1524,7 +1578,16 @@ class Lowerer {
 
   int emitLoopDelta(const Expr& expr, const std::string& counter,
                     const std::unordered_set<std::string>& assigned,
+                    const LoopTemporaries& temporaries, bool afterIncrement,
                     int counterReg, int iterations, int32_t stepValue) {
+    if (const auto* temporary = loopTemporaryFor(expr, temporaries)) {
+      if (!temporary->value) fail("unsupported loop temporary");
+      if (temporary->afterIncrement != afterIncrement &&
+          exprReadsName(*temporary->value, counter))
+        fail("unsupported loop temporary phase");
+      return emitLoopDelta(*temporary->value, counter, assigned, temporaries,
+                           afterIncrement, counterReg, iterations, stepValue);
+    }
     if (exprIsLoopInvariant(expr, assigned)) {
       Value addend = lowerExpr(expr);
       requireInt(addend, "loop accumulator");
@@ -1565,7 +1628,16 @@ class Lowerer {
 
   int emitLoopPointValue(const Expr& expr, const std::string& counter,
                          const std::unordered_set<std::string>& assigned,
+                         const LoopTemporaries& temporaries, bool afterIncrement,
                          int counterAtPoint) {
+    if (const auto* temporary = loopTemporaryFor(expr, temporaries)) {
+      if (!temporary->value) fail("unsupported loop temporary");
+      if (temporary->afterIncrement != afterIncrement &&
+          exprReadsName(*temporary->value, counter))
+        fail("unsupported loop temporary phase");
+      return emitLoopPointValue(*temporary->value, counter, assigned, temporaries,
+                                afterIncrement, counterAtPoint);
+    }
     if (exprIsLoopInvariant(expr, assigned)) {
       Value value = lowerExpr(expr);
       requireInt(value, "loop assignment");
@@ -1646,13 +1718,22 @@ class Lowerer {
     int32_t stepValue = 0;
     std::vector<AccumulationUpdate> updates;
     std::vector<DirectLoopUpdate> directUpdates;
+    LoopTemporaries temporaries;
     std::unordered_set<std::string> assigned;
     assigned.insert(counter);
     bool seenIncrement = false;
 
     for (const Stmt* stmt : items) {
+      if (const auto* declStmt = std::get_if<Stmt::DeclStmt>(&stmt->node)) {
+        if (declStmt->decl.isConst || !declStmt->decl.init ||
+            temporaries.count(declStmt->decl.name) != 0)
+          return false;
+        temporaries[declStmt->decl.name] = {declStmt->decl.init.get(), seenIncrement};
+        continue;
+      }
       const auto* assign = std::get_if<Stmt::Assign>(&stmt->node);
       if (!assign) return false;
+      if (temporaries.count(assign->name) != 0) return false;
       int32_t candidateStep = 0;
       if (parseIncrement(*assign, counter, candidateStep)) {
         ++incrementCount;
@@ -1676,13 +1757,27 @@ class Lowerer {
       return false;
     if ((condition->op == BinaryOp::Gt || condition->op == BinaryOp::Ge) && stepValue >= 0)
       return false;
+    std::unordered_set<std::string> assignedWithoutCounter = assigned;
+    assignedWithoutCounter.erase(counter);
+    std::unordered_set<std::string> temporaryNames;
+    for (const auto& entry : temporaries) temporaryNames.insert(entry.first);
+    for (const auto& [name, temporary] : temporaries) {
+      if (!temporary.value || exprHasCall(*temporary.value) ||
+          exprReadsName(*temporary.value, name) ||
+          exprReadsAny(*temporary.value, assignedWithoutCounter) ||
+          exprReadsAny(*temporary.value, temporaryNames))
+        return false;
+    }
     for (const auto& update : updates) {
-      if (!update.addend || !isSupportedLoopAddend(*update.addend, counter, assigned))
+      if (!update.addend ||
+          !isSupportedLoopAddend(*update.addend, counter, assigned, temporaries,
+                                 update.afterIncrement))
         return false;
     }
     for (const auto& update : directUpdates) {
       if (update.target == counter || !update.value ||
-          !isSupportedLoopPointExpr(*update.value, counter, assigned))
+          !isSupportedLoopPointExpr(*update.value, counter, assigned, temporaries,
+                                    update.afterIncrement))
         return false;
     }
 
@@ -1721,7 +1816,8 @@ class Lowerer {
       Value base = lowerNameValue(update.target);
       requireInt(base, "loop accumulator");
       const int seriesStart = update.afterIncrement ? counterAfterIncrement : counterValue.reg;
-      const int delta = emitLoopDelta(*update.addend, counter, assigned, seriesStart,
+      const int delta = emitLoopDelta(*update.addend, counter, assigned, temporaries,
+                                      update.afterIncrement, seriesStart,
                                       iterations, stepValue);
       const int result = emitBinaryReg(update.sign > 0 ? BinaryOp::Add : BinaryOp::Sub,
                                       base.reg, delta);
@@ -1741,7 +1837,8 @@ class Lowerer {
     for (const auto& update : directUpdates) {
       const int counterAtPoint =
           update.afterIncrement ? lastCounterAfterIncrement : lastCounterBeforeIncrement;
-      const int value = emitLoopPointValue(*update.value, counter, assigned, counterAtPoint);
+      const int value = emitLoopPointValue(*update.value, counter, assigned, temporaries,
+                                           update.afterIncrement, counterAtPoint);
       emitStoreName(update.target, value);
     }
     int finalCounter = limit;
@@ -1891,6 +1988,7 @@ class RiscVEmitter {
     std::vector<int> spillSlots;
     int savedRegisterCount = 0;
     int spillCount = 0;
+    bool savesReturnAddress = true;
   };
 
   static int align16(int value) { return (value + 15) & ~15; }
@@ -1942,6 +2040,7 @@ class RiscVEmitter {
       }
     }
     const int physicalCount = savedPhysicalCount() + (hasCall ? 0 : 3);
+    allocation.savesReturnAddress = hasCall;
     const int localRegisterCount = std::min(function.localCount, std::max(0, physicalCount - 2));
     for (int i = 0; i < localRegisterCount; ++i)
       allocation.localRegisters[locals[i]] = i;
@@ -2221,7 +2320,8 @@ class RiscVEmitter {
     line(function.name + ":");
     if (fitsImmediate12(-frameSize)) {
       line("  addi sp, sp, -" + std::to_string(frameSize));
-      line("  sw ra, " + std::to_string(frameSize - 4) + "(sp)");
+      if (allocation.savesReturnAddress)
+        line("  sw ra, " + std::to_string(frameSize - 4) + "(sp)");
       line("  sw s0, " + std::to_string(frameSize - 8) + "(sp)");
       line("  addi s0, sp, " + std::to_string(frameSize));
       for (int i = 0; i < allocation.savedRegisterCount; ++i)
@@ -2231,7 +2331,7 @@ class RiscVEmitter {
       line("  li t0, " + std::to_string(frameSize));
       line("  sub sp, sp, t0");
       line("  add t6, sp, t0");
-      line("  sw ra, -4(t6)");
+      if (allocation.savesReturnAddress) line("  sw ra, -4(t6)");
       line("  sw s0, -8(t6)");
       line("  mv s0, t6");
       for (int i = 0; i < allocation.savedRegisterCount; ++i)
@@ -2378,7 +2478,7 @@ class RiscVEmitter {
     line(epilogue + ":");
     for (int i = 0; i < allocation.savedRegisterCount; ++i)
       loadAt(savedRegister(i), "s0", -12 - i * 4);
-    line("  lw ra, -4(s0)");
+    if (allocation.savesReturnAddress) line("  lw ra, -4(s0)");
     line("  lw t0, -8(s0)");
     line("  mv sp, s0");
     line("  mv s0, t0");
