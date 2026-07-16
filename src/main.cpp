@@ -497,6 +497,7 @@ class Lowerer {
           fail("duplicate global name '" + function.name + "'");
         FunctionSig sig{function.returnType, function.params.size()};
         functions_.emplace(function.name, sig);
+        functionBodies_[function.name] = &function;
         globalNames_[function.name] = true;
         lowerFunction(function);
       }
@@ -1263,6 +1264,8 @@ class Lowerer {
           fail("call to function before its declaration: '" + node.name + "'");
         if (found->second.arity != node.args.size())
           fail("wrong number of arguments in call to '" + node.name + "'");
+        if (auto inlined = tryInlineCall(node, found->second))
+          return *inlined;
         std::vector<int> args;
         for (const auto& arg : node.args) {
           Value value = lowerExpr(*arg);
@@ -1323,6 +1326,108 @@ class Lowerer {
     }
     IRInst end{IROp::Label}; end.name = endLabel; emit(std::move(end));
     return {result, Type::Int};
+  }
+
+  static const Stmt::Block* inlineableStraightLineBlock(const Function& function) {
+    if (function.returnType != Type::Int) return nullptr;
+    const auto* block = std::get_if<Stmt::Block>(&function.body->node);
+    if (!block || block->items.empty() || block->items.size() > 12) return nullptr;
+    for (size_t i = 0; i + 1 < block->items.size(); ++i) {
+      if (!std::holds_alternative<Stmt::DeclStmt>(block->items[i]->node) &&
+          !std::holds_alternative<Stmt::Empty>(block->items[i]->node))
+        return nullptr;
+    }
+    const auto* ret = std::get_if<Stmt::Return>(&block->items.back()->node);
+    if (!ret || !ret->value) return nullptr;
+    return block;
+  }
+
+  static const Expr* inlineBlockReturnExpr(const Stmt::Block& block) {
+    const auto* ret = std::get_if<Stmt::Return>(&block.items.back()->node);
+    return ret && ret->value ? ret->value.get() : nullptr;
+  }
+
+  static int exprSize(const Expr& expr) {
+    return std::visit([&](const auto& node) -> int {
+      using T = std::decay_t<decltype(node)>;
+      if constexpr (std::is_same_v<T, Expr::Unary>) {
+        return 1 + exprSize(*node.operand);
+      } else if constexpr (std::is_same_v<T, Expr::Binary>) {
+        return 1 + exprSize(*node.left) + exprSize(*node.right);
+      } else if constexpr (std::is_same_v<T, Expr::Call>) {
+        int total = 1;
+        for (const auto& arg : node.args) total += exprSize(*arg);
+        return total;
+      } else {
+        return 1;
+      }
+    }, expr.node);
+  }
+
+  static bool inlineExprHasCall(const Expr& expr) {
+    return std::visit([&](const auto& node) -> bool {
+      using T = std::decay_t<decltype(node)>;
+      if constexpr (std::is_same_v<T, Expr::Unary>) {
+        return inlineExprHasCall(*node.operand);
+      } else if constexpr (std::is_same_v<T, Expr::Binary>) {
+        return inlineExprHasCall(*node.left) || inlineExprHasCall(*node.right);
+      } else if constexpr (std::is_same_v<T, Expr::Call>) {
+        return true;
+      } else {
+        return false;
+      }
+    }, expr.node);
+  }
+
+  std::optional<int32_t> currentConstantValue(int reg) const {
+    std::optional<int32_t> result;
+    for (const auto& inst : current_.code) {
+      if (inst.dst == reg) {
+        if (result || inst.op != IROp::Imm) return std::nullopt;
+        result = inst.imm;
+      }
+    }
+    return result;
+  }
+
+  std::optional<Value> tryInlineCall(const Expr::Call& call, const FunctionSig& sig) {
+    if (!optimize_ || sig.type != Type::Int || call.name == current_.name)
+      return std::nullopt;
+    const auto body = functionBodies_.find(call.name);
+    if (body == functionBodies_.end()) return std::nullopt;
+    const Function& function = *body->second;
+    const Stmt::Block* inlineBlock = inlineableStraightLineBlock(function);
+    if (!inlineBlock) return std::nullopt;
+    const Expr* returned = inlineBlockReturnExpr(*inlineBlock);
+    if (!returned || exprSize(*returned) > 80) return std::nullopt;
+    if (inlineExprHasCall(*returned)) return std::nullopt;
+
+    std::vector<Value> args;
+    args.reserve(call.args.size());
+    for (const auto& arg : call.args) {
+      Value value = lowerExpr(*arg);
+      requireInt(value, "function argument");
+      args.push_back(value);
+    }
+
+    pushScope();
+    for (size_t i = 0; i < function.params.size(); ++i) {
+      Symbol symbol{SymbolKind::Local, newLocal(), 0, false};
+      declare(function.params[i], symbol);
+      IRInst store{IROp::StoreLocal};
+      store.left = symbol.slot;
+      store.right = args[i].reg;
+      emit(std::move(store));
+      if (const auto known = currentConstantValue(args[i].reg))
+        knownLocalValues_[symbol.slot] = *known;
+      else
+        knownLocalValues_[symbol.slot].reset();
+    }
+    for (size_t i = 0; i + 1 < inlineBlock->items.size(); ++i)
+      lowerStmt(*inlineBlock->items[i], false);
+    Value result = lowerExpr(*returned);
+    popScope();
+    return result;
   }
 
   static bool isName(const Expr& expr, const std::string& name) {
@@ -2206,6 +2311,7 @@ class Lowerer {
   std::unordered_map<std::string, Symbol> globals_;
   std::unordered_map<std::string, bool> globalNames_;
   std::unordered_map<std::string, FunctionSig> functions_;
+  std::unordered_map<std::string, const Function*> functionBodies_;
   std::vector<std::unordered_map<std::string, Symbol>> scopes_;
   std::vector<std::optional<int32_t>> knownLocalValues_;
   std::vector<std::string> breakLabels_, continueLabels_;
