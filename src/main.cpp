@@ -1377,6 +1377,55 @@ class Lowerer {
     }, expr.node);
   }
 
+  bool knownValueExpr(const Expr& expr, int32_t& value) const {
+    return std::visit([&](const auto& node) -> bool {
+      using T = std::decay_t<decltype(node)>;
+      if constexpr (std::is_same_v<T, Expr::Number>) {
+        value = node.value;
+        return true;
+      } else if constexpr (std::is_same_v<T, Expr::Name>) {
+        const Symbol* symbol = lookup(node.value);
+        if (!symbol) return false;
+        if (symbol->kind == SymbolKind::Constant) {
+          value = symbol->value;
+          return true;
+        }
+        if (symbol->kind == SymbolKind::Local &&
+            symbol->slot >= 0 &&
+            symbol->slot < static_cast<int>(knownLocalValues_.size()) &&
+            knownLocalValues_[symbol->slot]) {
+          value = *knownLocalValues_[symbol->slot];
+          return true;
+        }
+        return false;
+      } else if constexpr (std::is_same_v<T, Expr::Unary>) {
+        int32_t operand = 0;
+        if (!knownValueExpr(*node.operand, operand)) return false;
+        value = foldUnary(node.op, operand);
+        return true;
+      } else if constexpr (std::is_same_v<T, Expr::Binary>) {
+        int32_t left = 0;
+        if (!knownValueExpr(*node.left, left)) return false;
+        if (node.op == BinaryOp::And && left == 0) {
+          value = 0;
+          return true;
+        }
+        if (node.op == BinaryOp::Or && left != 0) {
+          value = 1;
+          return true;
+        }
+        int32_t right = 0;
+        if (!knownValueExpr(*node.right, right)) return false;
+        if ((node.op == BinaryOp::Div || node.op == BinaryOp::Mod) && right == 0)
+          return false;
+        value = foldBinary(node.op, left, right);
+        return true;
+      } else {
+        return false;
+      }
+    }, expr.node);
+  }
+
   static bool exprHasCall(const Expr& expr) {
     return std::visit([&](const auto& node) -> bool {
       using T = std::decay_t<decltype(node)>;
@@ -1422,17 +1471,17 @@ class Lowerer {
       return false;
     int32_t value = 0;
     if (binary->op == BinaryOp::Add && isName(*binary->left, name) &&
-        constantExprValue(*binary->right, value) && value > 0) {
+        knownValueExpr(*binary->right, value) && value > 0) {
       step = value;
       return true;
     }
     if (binary->op == BinaryOp::Add && isName(*binary->right, name) &&
-        constantExprValue(*binary->left, value) && value > 0) {
+        knownValueExpr(*binary->left, value) && value > 0) {
       step = value;
       return true;
     }
     if (binary->op == BinaryOp::Sub && isName(*binary->left, name) &&
-        constantExprValue(*binary->right, value) && value > 0) {
+        knownValueExpr(*binary->right, value) && value > 0) {
       step = -value;
       return true;
     }
@@ -1721,7 +1770,7 @@ class Lowerer {
                               BinaryOp& op, int32_t& value) {
     const auto* binary = std::get_if<Expr::Binary>(&expr.node);
     if (!binary || !isName(*binary->left, counter) ||
-        !constantExprValue(*binary->right, value))
+        !knownValueExpr(*binary->right, value))
       return false;
     op = binary->op;
     return true;
@@ -1733,7 +1782,7 @@ class Lowerer {
       return false;
     const auto* loopName = std::get_if<Expr::Name>(&condition->left->node);
     int32_t boundaryValue = 0;
-    if (!loopName || !constantExprValue(*condition->right, boundaryValue)) return false;
+    if (!loopName || !knownValueExpr(*condition->right, boundaryValue)) return false;
     int32_t limitValue = boundaryValue;
     if (condition->op == BinaryOp::Le) {
       if (limitValue == std::numeric_limits<int32_t>::max()) return false;
@@ -1813,6 +1862,7 @@ class Lowerer {
     }
 
     if (incrementCount != 1 || stepValue != 1 || updates.empty()) return false;
+    if (exprReadsAny(*condition->right, assigned)) return false;
     std::unordered_set<std::string> assignedWithoutCounter = assigned;
     assignedWithoutCounter.erase(counter);
     std::unordered_set<std::string> temporaryNames;
@@ -1882,7 +1932,7 @@ class Lowerer {
       return false;
     const auto* loopName = std::get_if<Expr::Name>(&condition->left->node);
     int32_t boundaryValue = 0;
-    if (!loopName || !constantExprValue(*condition->right, boundaryValue)) return false;
+    if (!loopName || !knownValueExpr(*condition->right, boundaryValue)) return false;
     int32_t limitValue = boundaryValue;
     if (condition->op == BinaryOp::Le) {
       if (limitValue == std::numeric_limits<int32_t>::max()) return false;
@@ -1940,6 +1990,7 @@ class Lowerer {
     }
 
     if (incrementCount != 1) return false;
+    if (exprReadsAny(*condition->right, assigned)) return false;
     if ((condition->op == BinaryOp::Lt || condition->op == BinaryOp::Le) && stepValue <= 0)
       return false;
     if ((condition->op == BinaryOp::Gt || condition->op == BinaryOp::Ge) && stepValue >= 0)
@@ -2071,7 +2122,7 @@ class Lowerer {
           IRInst store{IROp::StoreLocal}; store.left = symbol.slot; store.right = init.reg;
           emit(std::move(store));
           int32_t known = 0;
-          if (constantExprValue(*node.decl.init, known))
+          if (knownValueExpr(*node.decl.init, known))
             knownLocalValues_[symbol.slot] = known;
           else
             knownLocalValues_[symbol.slot].reset();
@@ -2090,7 +2141,7 @@ class Lowerer {
         if (symbol->kind == SymbolKind::Local &&
             symbol->slot >= 0 && symbol->slot < static_cast<int>(knownLocalValues_.size())) {
           int32_t known = 0;
-          if (constantExprValue(*node.value, known))
+          if (knownValueExpr(*node.value, known))
             knownLocalValues_[symbol->slot] = known;
           else
             knownLocalValues_[symbol->slot].reset();
@@ -2244,11 +2295,16 @@ class RiscVEmitter {
         break;
       }
     }
-    const int physicalCount = savedPhysicalCount() + (hasCall ? 0 : 3);
+    const int callerSavedPhysicalStart = savedPhysicalCount();
+    const int callerSavedPhysicalCount = hasCall ? 0 : 3;
+    const int physicalCount = savedPhysicalCount() + callerSavedPhysicalCount;
     allocation.savesReturnAddress = hasCall;
     const int localRegisterCount = std::min(function.localCount, std::max(0, physicalCount - 2));
-    for (int i = 0; i < localRegisterCount; ++i)
-      allocation.localRegisters[locals[i]] = i;
+    int assignedLocalRegisters = 0;
+    for (int i = 0; i < callerSavedPhysicalCount && assignedLocalRegisters < localRegisterCount; ++i)
+      allocation.localRegisters[locals[assignedLocalRegisters++]] = callerSavedPhysicalStart + i;
+    for (int i = 0; assignedLocalRegisters < localRegisterCount; ++i)
+      allocation.localRegisters[locals[assignedLocalRegisters++]] = i;
 
     const int infinity = std::numeric_limits<int>::max();
     std::vector<int> first(function.registerCount, infinity);
@@ -2510,6 +2566,53 @@ class RiscVEmitter {
     return positivePowerOfTwoShift(static_cast<int32_t>(absolute));
   }
 
+  bool emitMultiplyByConstant(const std::string& source, int32_t constant,
+                              const std::string& destination) {
+    if (constant == 0) {
+      line("  li " + destination + ", 0");
+      return true;
+    }
+    if (constant == 1) {
+      if (destination != source) line("  mv " + destination + ", " + source);
+      return true;
+    }
+    if (constant == -1) {
+      line("  neg " + destination + ", " + source);
+      return true;
+    }
+
+    const int64_t absolute = constant < 0 ? -static_cast<int64_t>(constant) : constant;
+    if (absolute > std::numeric_limits<int32_t>::max()) return false;
+    std::vector<int> shifts;
+    uint32_t bits = static_cast<uint32_t>(absolute);
+    for (int shift = 0; bits != 0; ++shift, bits >>= 1) {
+      if ((bits & 1U) != 0) shifts.push_back(shift);
+    }
+    if (shifts.empty() || shifts.size() > 3) return false;
+    if (destination == source && shifts.size() > 1) return false;
+
+    bool initialized = false;
+    for (const int shift : shifts) {
+      if (!initialized) {
+        if (shift == 0) {
+          if (destination != source) line("  mv " + destination + ", " + source);
+        } else {
+          line("  slli " + destination + ", " + source + ", " + std::to_string(shift));
+        }
+        initialized = true;
+      } else {
+        if (shift == 0) {
+          line("  add " + destination + ", " + destination + ", " + source);
+        } else {
+          line("  slli t6, " + source + ", " + std::to_string(shift));
+          line("  add " + destination + ", " + destination + ", t6");
+        }
+      }
+    }
+    if (constant < 0) line("  neg " + destination + ", " + destination);
+    return true;
+  }
+
   void emitFunction(const IRFunction& function) {
     const Allocation allocation = allocateRegisters(function);
     allocation_ = &allocation;
@@ -2749,22 +2852,18 @@ class RiscVEmitter {
         break;
       case BinaryOp::Mul:
         if (rightConst) {
-          if (const auto shift = positivePowerOfTwoShift(*rightConst)) {
-            const std::string left = leftOperand();
-            const std::string dst = destination();
-            line("  slli " + dst + ", " + left + ", " + std::to_string(*shift));
-          } else {
+          const std::string left = leftOperand();
+          const std::string dst = destination();
+          if (!emitMultiplyByConstant(left, *rightConst, dst)) {
             const std::string left = leftOperand();
             const std::string right = rightOperand();
             const std::string dst = destination();
             line("  mul " + dst + ", " + left + ", " + right);
           }
         } else if (leftConst) {
-          if (const auto shift = positivePowerOfTwoShift(*leftConst)) {
-            const std::string right = rightOperand();
-            const std::string dst = destination();
-            line("  slli " + dst + ", " + right + ", " + std::to_string(*shift));
-          } else {
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          if (!emitMultiplyByConstant(right, *leftConst, dst)) {
             const std::string left = leftOperand();
             const std::string right = rightOperand();
             const std::string dst = destination();
