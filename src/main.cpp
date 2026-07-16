@@ -2195,15 +2195,18 @@ class Lowerer {
                        condition->op != BinaryOp::Gt && condition->op != BinaryOp::Ge))
       return false;
     const auto* loopName = std::get_if<Expr::Name>(&condition->left->node);
+    if (!loopName) return false;
+    std::optional<int32_t> constantBoundary;
     int32_t boundaryValue = 0;
-    if (!loopName || !knownValueExpr(*condition->right, boundaryValue)) return false;
-    int32_t limitValue = boundaryValue;
-    if (condition->op == BinaryOp::Le) {
-      if (limitValue == std::numeric_limits<int32_t>::max()) return false;
-      ++limitValue;
-    } else if (condition->op == BinaryOp::Ge) {
-      if (limitValue == std::numeric_limits<int32_t>::min()) return false;
-      --limitValue;
+    if (knownValueExpr(*condition->right, boundaryValue))
+      constantBoundary = boundaryValue;
+    if (constantBoundary) {
+      if (condition->op == BinaryOp::Le &&
+          *constantBoundary == std::numeric_limits<int32_t>::max())
+        return false;
+      if (condition->op == BinaryOp::Ge &&
+          *constantBoundary == std::numeric_limits<int32_t>::min())
+        return false;
     }
 
     std::vector<const Stmt*> items;
@@ -2254,7 +2257,7 @@ class Lowerer {
     }
 
     if (incrementCount != 1) return false;
-    if (exprReadsAny(*condition->right, assigned)) return false;
+    if (!exprIsLoopInvariant(*condition->right, assigned)) return false;
     if ((condition->op == BinaryOp::Lt || condition->op == BinaryOp::Le) && stepValue <= 0)
       return false;
     if ((condition->op == BinaryOp::Gt || condition->op == BinaryOp::Ge) && stepValue >= 0)
@@ -2285,8 +2288,17 @@ class Lowerer {
 
     Value counterValue = lowerNameValue(counter);
     requireInt(counterValue, "while condition");
-    const int limit = emitImm(limitValue);
-    const int boundary = emitImm(boundaryValue);
+    Value boundaryValueRuntime = lowerExpr(*condition->right);
+    requireInt(boundaryValueRuntime, "while boundary");
+    const int boundary = boundaryValueRuntime.reg;
+    int limit = boundary;
+    if (condition->op == BinaryOp::Le) {
+      const int one = emitImm(1);
+      limit = emitBinaryReg(BinaryOp::Add, boundary, one);
+    } else if (condition->op == BinaryOp::Ge) {
+      const int one = emitImm(1);
+      limit = emitBinaryReg(BinaryOp::Sub, boundary, one);
+    }
     const int conditionReg = emitBinaryReg(condition->op, counterValue.reg, boundary);
     const std::string endLabel = newLabel("counted_loop_end");
     IRInst skip{IROp::BranchZero};
@@ -2970,48 +2982,32 @@ class RiscVEmitter {
     const int valueSlots = function.localCount + allocation.spillCount;
     const int outgoingBytes = std::max(0, function.maxCallArgs - 8) * 4;
     const int savedBytes = allocation.savedRegisterCount * 4;
-    bool hasStackLocal = false;
-    for (int physical : allocation.localRegisters) {
-      if (physical < 0) {
-        hasStackLocal = true;
-        break;
-      }
-    }
-    const bool needsFrame = allocation.savesReturnAddress ||
-                            allocation.savedRegisterCount > 0 ||
-                            allocation.spillCount > 0 ||
-                            outgoingBytes > 0 ||
-                            hasStackLocal ||
-                            function.params.size() > 8;
-    const int frameSize =
-        needsFrame ? align16(8 + savedBytes + valueSlots * 4 + outgoingBytes) : 0;
+    const int frameSize = align16(8 + savedBytes + valueSlots * 4 + outgoingBytes);
     const std::string epilogue = ".L" + function.name + "_return";
 
     line("");
     line("  .globl " + function.name);
     line("  .type " + function.name + ", @function");
     line(function.name + ":");
-    if (needsFrame) {
-      if (fitsImmediate12(-frameSize)) {
-        line("  addi sp, sp, -" + std::to_string(frameSize));
-        if (allocation.savesReturnAddress)
-          line("  sw ra, " + std::to_string(frameSize - 4) + "(sp)");
-        line("  sw s0, " + std::to_string(frameSize - 8) + "(sp)");
-        line("  addi s0, sp, " + std::to_string(frameSize));
-        for (int i = 0; i < allocation.savedRegisterCount; ++i)
-          line("  sw " + savedRegister(i) + ", " +
-               std::to_string(frameSize - 12 - i * 4) + "(sp)");
-      } else {
-        line("  li t0, " + std::to_string(frameSize));
-        line("  sub sp, sp, t0");
-        line("  add t6, sp, t0");
-        if (allocation.savesReturnAddress) line("  sw ra, -4(t6)");
-        line("  sw s0, -8(t6)");
-        line("  mv s0, t6");
-        for (int i = 0; i < allocation.savedRegisterCount; ++i)
-          line("  sw " + savedRegister(i) + ", " +
-               std::to_string(-12 - i * 4) + "(s0)");
-      }
+    if (fitsImmediate12(-frameSize)) {
+      line("  addi sp, sp, -" + std::to_string(frameSize));
+      if (allocation.savesReturnAddress)
+        line("  sw ra, " + std::to_string(frameSize - 4) + "(sp)");
+      line("  sw s0, " + std::to_string(frameSize - 8) + "(sp)");
+      line("  addi s0, sp, " + std::to_string(frameSize));
+      for (int i = 0; i < allocation.savedRegisterCount; ++i)
+        line("  sw " + savedRegister(i) + ", " +
+             std::to_string(frameSize - 12 - i * 4) + "(sp)");
+    } else {
+      line("  li t0, " + std::to_string(frameSize));
+      line("  sub sp, sp, t0");
+      line("  add t6, sp, t0");
+      if (allocation.savesReturnAddress) line("  sw ra, -4(t6)");
+      line("  sw s0, -8(t6)");
+      line("  mv s0, t6");
+      for (int i = 0; i < allocation.savedRegisterCount; ++i)
+        line("  sw " + savedRegister(i) + ", " +
+             std::to_string(-12 - i * 4) + "(s0)");
     }
     for (size_t i = 0; i < function.params.size(); ++i) {
       if (i < 8) {
@@ -3146,22 +3142,17 @@ class RiscVEmitter {
             const std::string value = valueOperand(function, inst.left, "t0");
             if (value != "a0") line("  mv a0, " + value);
           }
-          if (needsFrame)
-            line("  j " + epilogue);
-          else
-            line("  ret");
+          line("  j " + epilogue);
           break;
       }
     }
     line(epilogue + ":");
-    if (needsFrame) {
-      for (int i = 0; i < allocation.savedRegisterCount; ++i)
-        loadAt(savedRegister(i), "s0", -12 - i * 4);
-      if (allocation.savesReturnAddress) line("  lw ra, -4(s0)");
-      line("  lw t0, -8(s0)");
-      line("  mv sp, s0");
-      line("  mv s0, t0");
-    }
+    for (int i = 0; i < allocation.savedRegisterCount; ++i)
+      loadAt(savedRegister(i), "s0", -12 - i * 4);
+    if (allocation.savesReturnAddress) line("  lw ra, -4(s0)");
+    line("  lw t0, -8(s0)");
+    line("  mv sp, s0");
+    line("  mv s0, t0");
     line("  ret");
     line("  .size " + function.name + ", .-" + function.name);
     allocation_ = nullptr;
