@@ -1414,16 +1414,22 @@ class Lowerer {
                       int32_t& step) {
     if (assign.name != name) return false;
     const auto* binary = std::get_if<Expr::Binary>(&assign.value->node);
-    if (!binary || binary->op != BinaryOp::Add) return false;
+    if (!binary || (binary->op != BinaryOp::Add && binary->op != BinaryOp::Sub))
+      return false;
     int32_t value = 0;
-    if (isName(*binary->left, name) && constantExprValue(*binary->right, value) &&
-        value > 0) {
+    if (binary->op == BinaryOp::Add && isName(*binary->left, name) &&
+        constantExprValue(*binary->right, value) && value > 0) {
       step = value;
       return true;
     }
-    if (isName(*binary->right, name) && constantExprValue(*binary->left, value) &&
-        value > 0) {
+    if (binary->op == BinaryOp::Add && isName(*binary->right, name) &&
+        constantExprValue(*binary->left, value) && value > 0) {
       step = value;
+      return true;
+    }
+    if (binary->op == BinaryOp::Sub && isName(*binary->left, name) &&
+        constantExprValue(*binary->right, value) && value > 0) {
+      step = -value;
       return true;
     }
     return false;
@@ -1553,14 +1559,19 @@ class Lowerer {
 
   bool lowerCountedAccumulationLoop(const Stmt::While& node) {
     const auto* condition = std::get_if<Expr::Binary>(&node.condition->node);
-    if (!condition || (condition->op != BinaryOp::Lt && condition->op != BinaryOp::Le))
+    if (!condition || (condition->op != BinaryOp::Lt && condition->op != BinaryOp::Le &&
+                       condition->op != BinaryOp::Gt && condition->op != BinaryOp::Ge))
       return false;
     const auto* loopName = std::get_if<Expr::Name>(&condition->left->node);
-    int32_t limitValue = 0;
-    if (!loopName || !constantExprValue(*condition->right, limitValue)) return false;
+    int32_t boundaryValue = 0;
+    if (!loopName || !constantExprValue(*condition->right, boundaryValue)) return false;
+    int32_t limitValue = boundaryValue;
     if (condition->op == BinaryOp::Le) {
       if (limitValue == std::numeric_limits<int32_t>::max()) return false;
       ++limitValue;
+    } else if (condition->op == BinaryOp::Ge) {
+      if (limitValue == std::numeric_limits<int32_t>::min()) return false;
+      --limitValue;
     }
 
     std::vector<const Stmt*> items;
@@ -1594,6 +1605,10 @@ class Lowerer {
     }
 
     if (incrementCount != 1) return false;
+    if ((condition->op == BinaryOp::Lt || condition->op == BinaryOp::Le) && stepValue <= 0)
+      return false;
+    if ((condition->op == BinaryOp::Gt || condition->op == BinaryOp::Ge) && stepValue >= 0)
+      return false;
     for (const auto& update : updates) {
       if (!update.addend || !isSupportedLoopAddend(*update.addend, counter, assigned))
         return false;
@@ -1602,18 +1617,22 @@ class Lowerer {
     Value counterValue = lowerNameValue(counter);
     requireInt(counterValue, "while condition");
     const int limit = emitImm(limitValue);
-    const int conditionReg = emitBinaryReg(BinaryOp::Lt, counterValue.reg, limit);
+    const int boundary = emitImm(boundaryValue);
+    const int conditionReg = emitBinaryReg(condition->op, counterValue.reg, boundary);
     const std::string endLabel = newLabel("counted_loop_end");
     IRInst skip{IROp::BranchZero};
     skip.left = conditionReg;
     skip.name = endLabel;
     emit(std::move(skip));
 
-    int iterations = emitBinaryReg(BinaryOp::Sub, limit, counterValue.reg);
-    if (stepValue != 1) {
-      const int bias = emitImm(stepValue - 1);
+    const int positiveStep = stepValue > 0 ? stepValue : -stepValue;
+    int iterations = stepValue > 0
+                         ? emitBinaryReg(BinaryOp::Sub, limit, counterValue.reg)
+                         : emitBinaryReg(BinaryOp::Sub, counterValue.reg, limit);
+    if (positiveStep != 1) {
+      const int bias = emitImm(positiveStep - 1);
       const int biased = emitBinaryReg(BinaryOp::Add, iterations, bias);
-      const int step = emitImm(stepValue);
+      const int step = emitImm(positiveStep);
       iterations = emitBinaryReg(BinaryOp::Div, biased, step);
     }
     for (const auto& update : updates) {
@@ -1626,7 +1645,7 @@ class Lowerer {
       emitStoreName(update.target, result);
     }
     int finalCounter = limit;
-    if (stepValue != 1) {
+    if (positiveStep != 1) {
       const int step = emitImm(stepValue);
       const int distance = emitBinaryReg(BinaryOp::Mul, iterations, step);
       finalCounter = emitBinaryReg(BinaryOp::Add, counterValue.reg, distance);
@@ -2080,6 +2099,13 @@ class RiscVEmitter {
     return shift;
   }
 
+  static std::optional<int> constantDivisorShift(int32_t value) {
+    if (value == 0) return std::nullopt;
+    const int64_t absolute = value < 0 ? -static_cast<int64_t>(value) : value;
+    if (absolute > std::numeric_limits<int32_t>::max()) return std::nullopt;
+    return positivePowerOfTwoShift(static_cast<int32_t>(absolute));
+  }
+
   void emitFunction(const IRFunction& function) {
     const Allocation allocation = allocateRegisters(function);
     allocation_ = &allocation;
@@ -2142,7 +2168,6 @@ class RiscVEmitter {
         default: break;
       }
     }
-
     for (size_t pc = 0; pc < function.code.size(); ++pc) {
       const auto& inst = function.code[pc];
       if (inst.op == IROp::Binary && pc + 1 < function.code.size() &&
@@ -2265,16 +2290,27 @@ class RiscVEmitter {
   void emitBinary(const IRFunction& function, const IRInst& inst) {
     const std::optional<int32_t> leftConst = constantValue(function, inst.left);
     const std::optional<int32_t> rightConst = constantValue(function, inst.right);
-    const std::string left = valueOperand(function, inst.left, "t0");
-    const std::string right = valueOperand(function, inst.right, "t1");
-    const std::string dst = valueDestination(inst.dst, "t2");
+    auto leftOperand = [&]() { return valueOperand(function, inst.left, "t0"); };
+    auto rightOperand = [&]() { return valueOperand(function, inst.right, "t1"); };
+    std::string producedIn;
+    auto destination = [&]() {
+      producedIn = valueDestination(inst.dst, "t2");
+      return producedIn;
+    };
     switch (inst.binary) {
       case BinaryOp::Add:
         if (rightConst && fitsImmediate12(*rightConst)) {
+          const std::string left = leftOperand();
+          const std::string dst = destination();
           line("  addi " + dst + ", " + left + ", " + std::to_string(*rightConst));
         } else if (leftConst && fitsImmediate12(*leftConst)) {
+          const std::string right = rightOperand();
+          const std::string dst = destination();
           line("  addi " + dst + ", " + right + ", " + std::to_string(*leftConst));
         } else {
+          const std::string left = leftOperand();
+          const std::string right = rightOperand();
+          const std::string dst = destination();
           line("  add " + dst + ", " + left + ", " + right);
         }
         break;
@@ -2282,44 +2318,67 @@ class RiscVEmitter {
         if (rightConst) {
           const int64_t negated = -static_cast<int64_t>(*rightConst);
           if (negated >= -2048 && negated <= 2047) {
+            const std::string left = leftOperand();
+            const std::string dst = destination();
             line("  addi " + dst + ", " + left + ", " + std::to_string(negated));
           } else if (leftConst && *leftConst == 0) {
+            const std::string right = rightOperand();
+            const std::string dst = destination();
             line("  neg " + dst + ", " + right);
           } else {
+            const std::string left = leftOperand();
+            const std::string right = rightOperand();
+            const std::string dst = destination();
             line("  sub " + dst + ", " + left + ", " + right);
           }
         } else if (leftConst && *leftConst == 0) {
+          const std::string right = rightOperand();
+          const std::string dst = destination();
           line("  neg " + dst + ", " + right);
         } else {
+          const std::string left = leftOperand();
+          const std::string right = rightOperand();
+          const std::string dst = destination();
           line("  sub " + dst + ", " + left + ", " + right);
         }
         break;
       case BinaryOp::Mul:
         if (rightConst) {
           if (const auto shift = positivePowerOfTwoShift(*rightConst)) {
+            const std::string left = leftOperand();
+            const std::string dst = destination();
             line("  slli " + dst + ", " + left + ", " + std::to_string(*shift));
           } else {
+            const std::string left = leftOperand();
+            const std::string right = rightOperand();
+            const std::string dst = destination();
             line("  mul " + dst + ", " + left + ", " + right);
           }
         } else if (leftConst) {
           if (const auto shift = positivePowerOfTwoShift(*leftConst)) {
+            const std::string right = rightOperand();
+            const std::string dst = destination();
             line("  slli " + dst + ", " + right + ", " + std::to_string(*shift));
           } else {
+            const std::string left = leftOperand();
+            const std::string right = rightOperand();
+            const std::string dst = destination();
             line("  mul " + dst + ", " + left + ", " + right);
           }
         } else {
+          const std::string left = leftOperand();
+          const std::string right = rightOperand();
+          const std::string dst = destination();
           line("  mul " + dst + ", " + left + ", " + right);
         }
         break;
       case BinaryOp::Div:
         if (rightConst && *rightConst != 0) {
           const int32_t divisor = *rightConst;
-          const int64_t absDivisor64 =
-              divisor < 0 ? -static_cast<int64_t>(divisor) : divisor;
-          const auto shift = absDivisor64 <= std::numeric_limits<int32_t>::max()
-                                 ? positivePowerOfTwoShift(static_cast<int32_t>(absDivisor64))
-                                 : std::nullopt;
+          const auto shift = constantDivisorShift(divisor);
           if (shift) {
+            const std::string left = leftOperand();
+            const std::string dst = destination();
             if (*shift == 0) {
               if (dst != left) line("  mv " + dst + ", " + left);
             } else {
@@ -2330,21 +2389,25 @@ class RiscVEmitter {
             }
             if (divisor < 0) line("  neg " + dst + ", " + dst);
           } else {
+            const std::string left = leftOperand();
+            const std::string right = rightOperand();
+            const std::string dst = destination();
             line("  div " + dst + ", " + left + ", " + right);
           }
         } else {
+          const std::string left = leftOperand();
+          const std::string right = rightOperand();
+          const std::string dst = destination();
           line("  div " + dst + ", " + left + ", " + right);
         }
         break;
       case BinaryOp::Mod:
         if (rightConst && *rightConst != 0) {
           const int32_t divisor = *rightConst;
-          const int64_t absDivisor64 =
-              divisor < 0 ? -static_cast<int64_t>(divisor) : divisor;
-          const auto shift = absDivisor64 <= std::numeric_limits<int32_t>::max()
-                                 ? positivePowerOfTwoShift(static_cast<int32_t>(absDivisor64))
-                                 : std::nullopt;
+          const auto shift = constantDivisorShift(divisor);
           if (shift) {
+            const std::string left = leftOperand();
+            const std::string dst = destination();
             if (*shift == 0) {
               line("  li " + dst + ", 0");
             } else {
@@ -2356,35 +2419,100 @@ class RiscVEmitter {
               line("  sub " + dst + ", " + left + ", t6");
             }
           } else {
+            const std::string left = leftOperand();
+            const std::string right = rightOperand();
+            const std::string dst = destination();
             line("  rem " + dst + ", " + left + ", " + right);
           }
         } else {
+          const std::string left = leftOperand();
+          const std::string right = rightOperand();
+          const std::string dst = destination();
           line("  rem " + dst + ", " + left + ", " + right);
         }
         break;
-      case BinaryOp::Lt: line("  slt " + dst + ", " + left + ", " + right); break;
-      case BinaryOp::Gt: line("  slt " + dst + ", " + right + ", " + left); break;
+      case BinaryOp::Lt:
+        if (rightConst && fitsImmediate12(*rightConst)) {
+          const std::string left = leftOperand();
+          const std::string dst = destination();
+          line("  slti " + dst + ", " + left + ", " + std::to_string(*rightConst));
+        } else {
+          const std::string left = leftOperand();
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  slt " + dst + ", " + left + ", " + right);
+        }
+        break;
+      case BinaryOp::Gt:
+        {
+          const std::string left = leftOperand();
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  slt " + dst + ", " + right + ", " + left);
+        }
+        break;
       case BinaryOp::Le:
-        line("  slt " + dst + ", " + right + ", " + left);
-        line("  xori " + dst + ", " + dst + ", 1");
+        {
+          const std::string left = leftOperand();
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  slt " + dst + ", " + right + ", " + left);
+          line("  xori " + dst + ", " + dst + ", 1");
+        }
         break;
       case BinaryOp::Ge:
-        line("  slt " + dst + ", " + left + ", " + right);
-        line("  xori " + dst + ", " + dst + ", 1");
+        if (rightConst && fitsImmediate12(*rightConst)) {
+          const std::string left = leftOperand();
+          const std::string dst = destination();
+          line("  slti " + dst + ", " + left + ", " + std::to_string(*rightConst));
+          line("  xori " + dst + ", " + dst + ", 1");
+        } else {
+          const std::string left = leftOperand();
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  slt " + dst + ", " + left + ", " + right);
+          line("  xori " + dst + ", " + dst + ", 1");
+        }
         break;
       case BinaryOp::Eq:
-        line("  xor " + dst + ", " + left + ", " + right);
-        line("  seqz " + dst + ", " + dst);
+        if (rightConst && *rightConst == 0) {
+          const std::string left = leftOperand();
+          const std::string dst = destination();
+          line("  seqz " + dst + ", " + left);
+        } else if (leftConst && *leftConst == 0) {
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  seqz " + dst + ", " + right);
+        } else {
+          const std::string left = leftOperand();
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  xor " + dst + ", " + left + ", " + right);
+          line("  seqz " + dst + ", " + dst);
+        }
         break;
       case BinaryOp::Ne:
-        line("  xor " + dst + ", " + left + ", " + right);
-        line("  snez " + dst + ", " + dst);
+        if (rightConst && *rightConst == 0) {
+          const std::string left = leftOperand();
+          const std::string dst = destination();
+          line("  snez " + dst + ", " + left);
+        } else if (leftConst && *leftConst == 0) {
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  snez " + dst + ", " + right);
+        } else {
+          const std::string left = leftOperand();
+          const std::string right = rightOperand();
+          const std::string dst = destination();
+          line("  xor " + dst + ", " + left + ", " + right);
+          line("  snez " + dst + ", " + dst);
+        }
         break;
       case BinaryOp::And:
       case BinaryOp::Or:
         throw Error("internal error: logical operation was not lowered");
     }
-    finishValue(function, inst.dst, dst);
+    finishValue(function, inst.dst, producedIn);
   }
 
   void emitCall(const IRFunction& function, const IRInst& inst) {
