@@ -1441,6 +1441,11 @@ class Lowerer {
     int sign = 1;
   };
 
+  struct DirectLoopUpdate {
+    std::string target;
+    const Expr* value = nullptr;
+  };
+
   static bool parseAccumulationUpdate(const Stmt::Assign& assign,
                                       AccumulationUpdate& update) {
     const auto* binary = std::get_if<Expr::Binary>(&assign.value->node);
@@ -1473,6 +1478,22 @@ class Lowerer {
 
   static bool isSupportedLoopAddend(const Expr& expr, const std::string& counter,
                                     const std::unordered_set<std::string>& assigned) {
+    if (exprIsLoopInvariant(expr, assigned) || isName(expr, counter)) return true;
+    const auto* binary = std::get_if<Expr::Binary>(&expr.node);
+    if (!binary) return false;
+    const bool leftCounter = isName(*binary->left, counter);
+    const bool rightCounter = isName(*binary->right, counter);
+    if (binary->op == BinaryOp::Mul)
+      return (leftCounter && exprIsLoopInvariant(*binary->right, assigned)) ||
+             (rightCounter && exprIsLoopInvariant(*binary->left, assigned));
+    if (binary->op == BinaryOp::Add || binary->op == BinaryOp::Sub)
+      return (leftCounter && exprIsLoopInvariant(*binary->right, assigned)) ||
+             (rightCounter && exprIsLoopInvariant(*binary->left, assigned));
+    return false;
+  }
+
+  static bool isSupportedLoopPointExpr(const Expr& expr, const std::string& counter,
+                                       const std::unordered_set<std::string>& assigned) {
     if (exprIsLoopInvariant(expr, assigned) || isName(expr, counter)) return true;
     const auto* binary = std::get_if<Expr::Binary>(&expr.node);
     if (!binary) return false;
@@ -1540,6 +1561,42 @@ class Lowerer {
     fail("unsupported loop addend");
   }
 
+  int emitLoopPointValue(const Expr& expr, const std::string& counter,
+                         const std::unordered_set<std::string>& assigned,
+                         int counterAtPoint) {
+    if (exprIsLoopInvariant(expr, assigned)) {
+      Value value = lowerExpr(expr);
+      requireInt(value, "loop assignment");
+      return value.reg;
+    }
+    if (isName(expr, counter)) return counterAtPoint;
+
+    const auto* binary = std::get_if<Expr::Binary>(&expr.node);
+    if (!binary) fail("unsupported loop assignment");
+    const bool leftCounter = isName(*binary->left, counter);
+    const bool rightCounter = isName(*binary->right, counter);
+    const Expr* invariant = nullptr;
+    if (leftCounter && exprIsLoopInvariant(*binary->right, assigned))
+      invariant = binary->right.get();
+    else if (rightCounter && exprIsLoopInvariant(*binary->left, assigned))
+      invariant = binary->left.get();
+    else
+      fail("unsupported loop assignment");
+
+    Value invariantValue = lowerExpr(*invariant);
+    requireInt(invariantValue, "loop assignment");
+    if (binary->op == BinaryOp::Mul)
+      return emitBinaryReg(BinaryOp::Mul, counterAtPoint, invariantValue.reg);
+    if (binary->op == BinaryOp::Add)
+      return emitBinaryReg(BinaryOp::Add, counterAtPoint, invariantValue.reg);
+    if (binary->op == BinaryOp::Sub) {
+      if (leftCounter)
+        return emitBinaryReg(BinaryOp::Sub, counterAtPoint, invariantValue.reg);
+      return emitBinaryReg(BinaryOp::Sub, invariantValue.reg, counterAtPoint);
+    }
+    fail("unsupported loop assignment");
+  }
+
   Value lowerNameValue(const std::string& name) {
     Expr::Name node{name};
     Expr expr{std::move(node)};
@@ -1586,6 +1643,7 @@ class Lowerer {
     int incrementCount = 0;
     int32_t stepValue = 0;
     std::vector<AccumulationUpdate> updates;
+    std::vector<DirectLoopUpdate> directUpdates;
     std::unordered_set<std::string> assigned;
     assigned.insert(counter);
 
@@ -1599,9 +1657,13 @@ class Lowerer {
         continue;
       }
       AccumulationUpdate update;
-      if (!parseAccumulationUpdate(*assign, update)) return false;
-      updates.push_back(update);
-      assigned.insert(update.target);
+      if (parseAccumulationUpdate(*assign, update)) {
+        updates.push_back(update);
+        assigned.insert(update.target);
+      } else {
+        directUpdates.push_back({assign->name, assign->value.get()});
+        assigned.insert(assign->name);
+      }
     }
 
     if (incrementCount != 1) return false;
@@ -1611,6 +1673,11 @@ class Lowerer {
       return false;
     for (const auto& update : updates) {
       if (!update.addend || !isSupportedLoopAddend(*update.addend, counter, assigned))
+        return false;
+    }
+    for (const auto& update : directUpdates) {
+      if (update.target == counter || !update.value ||
+          !isSupportedLoopPointExpr(*update.value, counter, assigned))
         return false;
     }
 
@@ -1643,6 +1710,18 @@ class Lowerer {
       const int result = emitBinaryReg(update.sign > 0 ? BinaryOp::Add : BinaryOp::Sub,
                                       base.reg, delta);
       emitStoreName(update.target, result);
+    }
+    int lastCounter = counterValue.reg;
+    if (!directUpdates.empty()) {
+      const int one = emitImm(1);
+      const int lastIndex = emitBinaryReg(BinaryOp::Sub, iterations, one);
+      const int step = emitImm(stepValue);
+      const int distance = emitBinaryReg(BinaryOp::Mul, lastIndex, step);
+      lastCounter = emitBinaryReg(BinaryOp::Add, counterValue.reg, distance);
+    }
+    for (const auto& update : directUpdates) {
+      const int value = emitLoopPointValue(*update.value, counter, assigned, lastCounter);
+      emitStoreName(update.target, value);
     }
     int finalCounter = limit;
     if (positiveStep != 1) {
