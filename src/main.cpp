@@ -1328,13 +1328,27 @@ class Lowerer {
     return {result, Type::Int};
   }
 
+  static bool inlineablePrefixStmt(const Stmt& stmt, std::unordered_set<std::string>& locals) {
+    if (std::holds_alternative<Stmt::Empty>(stmt.node)) return true;
+    if (const auto* decl = std::get_if<Stmt::DeclStmt>(&stmt.node)) {
+      if (decl->decl.isConst || !decl->decl.init || locals.count(decl->decl.name))
+        return false;
+      locals.insert(decl->decl.name);
+      return true;
+    }
+    if (const auto* assign = std::get_if<Stmt::Assign>(&stmt.node)) {
+      return locals.count(assign->name) != 0;
+    }
+    return false;
+  }
+
   static const Stmt::Block* inlineableStraightLineBlock(const Function& function) {
     if (function.returnType != Type::Int) return nullptr;
     const auto* block = std::get_if<Stmt::Block>(&function.body->node);
-    if (!block || block->items.empty() || block->items.size() > 12) return nullptr;
+    if (!block || block->items.empty() || block->items.size() > 24) return nullptr;
+    std::unordered_set<std::string> locals(function.params.begin(), function.params.end());
     for (size_t i = 0; i + 1 < block->items.size(); ++i) {
-      if (!std::holds_alternative<Stmt::DeclStmt>(block->items[i]->node) &&
-          !std::holds_alternative<Stmt::Empty>(block->items[i]->node))
+      if (!inlineablePrefixStmt(*block->items[i], locals))
         return nullptr;
     }
     const auto* ret = std::get_if<Stmt::Return>(&block->items.back()->node);
@@ -1399,7 +1413,7 @@ class Lowerer {
     const Stmt::Block* inlineBlock = inlineableStraightLineBlock(function);
     if (!inlineBlock) return std::nullopt;
     const Expr* returned = inlineBlockReturnExpr(*inlineBlock);
-    if (!returned || exprSize(*returned) > 80) return std::nullopt;
+    if (!returned || exprSize(*returned) > 120) return std::nullopt;
     if (inlineExprHasCall(*returned)) return std::nullopt;
 
     std::vector<Value> args;
@@ -2403,7 +2417,9 @@ class RiscVEmitter {
     }
     const int physicalCount = savedPhysicalCount() + (hasCall ? 0 : 3);
     allocation.savesReturnAddress = hasCall;
-    const int localRegisterCount = std::min(function.localCount, std::max(0, physicalCount - 2));
+    const int valueReserve = hasCall ? 4 : 6;
+    const int localRegisterCount =
+        std::min(function.localCount, std::max(0, physicalCount - valueReserve));
     for (int i = 0; i < localRegisterCount; ++i)
       allocation.localRegisters[locals[i]] = i;
 
