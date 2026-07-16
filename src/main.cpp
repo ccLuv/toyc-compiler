@@ -1722,12 +1722,6 @@ class Lowerer {
     bool afterIncrement = false;
   };
 
-  struct ConditionalAccumulationUpdate {
-    AccumulationUpdate update;
-    const Expr* matchValue = nullptr;
-    bool includeMatch = true;
-  };
-
   struct LoopTemporary {
     const Expr* value = nullptr;
     bool afterIncrement = false;
@@ -1894,39 +1888,6 @@ class Lowerer {
       return true;
     }
     return false;
-  }
-
-  static const Stmt::Assign* singleAssignStmt(const Stmt& stmt) {
-    if (const auto* assign = std::get_if<Stmt::Assign>(&stmt.node))
-      return assign;
-    const auto* block = std::get_if<Stmt::Block>(&stmt.node);
-    if (!block || block->items.size() != 1) return nullptr;
-    return std::get_if<Stmt::Assign>(&block->items.front()->node);
-  }
-
-  static bool parseConditionalAccumulation(const Stmt::If& ifStmt,
-                                           const std::string& counter,
-                                           ConditionalAccumulationUpdate& conditional) {
-    if (ifStmt.elseBranch) return false;
-    const auto* condition = std::get_if<Expr::Binary>(&ifStmt.condition->node);
-    if (!condition || (condition->op != BinaryOp::Eq && condition->op != BinaryOp::Ne))
-      return false;
-    const Expr* matchValue = nullptr;
-    if (isName(*condition->left, counter)) {
-      matchValue = condition->right.get();
-    } else if (isName(*condition->right, counter)) {
-      matchValue = condition->left.get();
-    } else {
-      return false;
-    }
-    const Stmt::Assign* assign = singleAssignStmt(*ifStmt.thenBranch);
-    if (!assign) return false;
-    AccumulationUpdate update;
-    if (!parseAccumulationUpdate(*assign, update)) return false;
-    conditional.update = update;
-    conditional.matchValue = matchValue;
-    conditional.includeMatch = condition->op == BinaryOp::Eq;
-    return true;
   }
 
   int emitBinaryReg(BinaryOp op, int left, int right) {
@@ -2451,18 +2412,7 @@ class Lowerer {
     }
     if (inclusiveLast <= startValue) return false;
 
-    Value counterValue = lowerNameValue(counter);
-    requireInt(counterValue, "while condition");
-    const int boundary = emitImm(boundaryValue);
-    const int conditionReg = emitBinaryReg(condition->op, counterValue.reg, boundary);
-    const std::string endLabel = newLabel("filtered_loop_end");
-    IRInst skipLoop{IROp::BranchZero};
-    skipLoop.left = conditionReg;
-    skipLoop.name = endLabel;
-    emit(std::move(skipLoop));
-
-    const int one = emitImm(1);
-    const int counterAfterIncrement = emitBinaryReg(BinaryOp::Add, counterValue.reg, one);
+    const int counterAfterIncrement = emitImm(startValue + 1);
     const int iterations = emitImm(inclusiveLast - startValue);
     for (const auto& update : updates) {
       Value base = lowerNameValue(update.target);
@@ -2481,9 +2431,6 @@ class Lowerer {
       emitStoreName(update.target, result);
     }
     emitStoreName(counter, emitImm(finalCounterValue));
-    IRInst end{IROp::Label};
-    end.name = endLabel;
-    emit(std::move(end));
     return true;
   }
 
@@ -2519,7 +2466,6 @@ class Lowerer {
     int incrementCount = 0;
     int32_t stepValue = 0;
     std::vector<AccumulationUpdate> updates;
-    std::vector<ConditionalAccumulationUpdate> conditionalUpdates;
     std::vector<DirectLoopUpdate> directUpdates;
     LoopTemporaries temporaries;
     std::unordered_set<std::string> assigned;
@@ -2532,14 +2478,6 @@ class Lowerer {
             temporaries.count(declStmt->decl.name) != 0)
           return false;
         temporaries[declStmt->decl.name] = {declStmt->decl.init.get(), seenIncrement};
-        continue;
-      }
-      if (const auto* ifStmt = std::get_if<Stmt::If>(&stmt->node)) {
-        ConditionalAccumulationUpdate conditional;
-        if (!parseConditionalAccumulation(*ifStmt, counter, conditional)) return false;
-        conditional.update.afterIncrement = seenIncrement;
-        conditionalUpdates.push_back(conditional);
-        assigned.insert(conditional.update.target);
         continue;
       }
       const auto* assign = std::get_if<Stmt::Assign>(&stmt->node);
@@ -2586,17 +2524,6 @@ class Lowerer {
                                  update.afterIncrement))
         return false;
     }
-    if (!conditionalUpdates.empty() && (stepValue != 1 && stepValue != -1))
-      return false;
-    for (const auto& conditional : conditionalUpdates) {
-      const auto& update = conditional.update;
-      if (!conditional.matchValue ||
-          exprReadsAny(*conditional.matchValue, assigned) ||
-          !update.addend ||
-          !isSupportedLoopAddend(*update.addend, counter, assigned, temporaries,
-                                 update.afterIncrement))
-        return false;
-    }
     for (const auto& update : directUpdates) {
       if (update.target == counter || !update.value ||
           !isSupportedLoopPointExpr(*update.value, counter, assigned, temporaries,
@@ -2604,35 +2531,79 @@ class Lowerer {
         return false;
     }
 
-    Value counterValue = lowerNameValue(counter);
-    requireInt(counterValue, "while condition");
-    Value boundaryValueRuntime = lowerExpr(*condition->right);
-    requireInt(boundaryValueRuntime, "while boundary");
-    const int boundary = boundaryValueRuntime.reg;
-    int limit = boundary;
-    if (condition->op == BinaryOp::Le) {
-      const int one = emitImm(1);
-      limit = emitBinaryReg(BinaryOp::Add, boundary, one);
-    } else if (condition->op == BinaryOp::Ge) {
-      const int one = emitImm(1);
-      limit = emitBinaryReg(BinaryOp::Sub, boundary, one);
-    }
-    const int conditionReg = emitBinaryReg(condition->op, counterValue.reg, boundary);
-    const std::string endLabel = newLabel("counted_loop_end");
-    IRInst skip{IROp::BranchZero};
-    skip.left = conditionReg;
-    skip.name = endLabel;
-    emit(std::move(skip));
-
     const int positiveStep = stepValue > 0 ? stepValue : -stepValue;
-    int iterations = stepValue > 0
-                         ? emitBinaryReg(BinaryOp::Sub, limit, counterValue.reg)
-                         : emitBinaryReg(BinaryOp::Sub, counterValue.reg, limit);
-    if (positiveStep != 1) {
-      const int bias = emitImm(positiveStep - 1);
-      const int biased = emitBinaryReg(BinaryOp::Add, iterations, bias);
-      const int step = emitImm(positiveStep);
-      iterations = emitBinaryReg(BinaryOp::Div, biased, step);
+    std::optional<int32_t> constantStart;
+    int32_t startValue = 0;
+    if (knownLocalValue(counter, startValue)) constantStart = startValue;
+
+    std::optional<int32_t> constantLimit;
+    std::optional<int32_t> constantFinalCounter;
+    std::optional<int32_t> constantIterationCount;
+    if (constantBoundary && constantStart) {
+      int64_t limitValue = *constantBoundary;
+      if (condition->op == BinaryOp::Le) {
+        ++limitValue;
+      } else if (condition->op == BinaryOp::Ge) {
+        --limitValue;
+      }
+      const bool executes = stepValue > 0 ? *constantStart < limitValue
+                                          : *constantStart > limitValue;
+      if (!executes) return false;
+      const int64_t distance = stepValue > 0
+                                   ? limitValue - *constantStart
+                                   : static_cast<int64_t>(*constantStart) - limitValue;
+      const int64_t iterationsValue = (distance + positiveStep - 1) / positiveStep;
+      const int64_t finalValue =
+          static_cast<int64_t>(*constantStart) + iterationsValue * stepValue;
+      if (limitValue < std::numeric_limits<int32_t>::min() ||
+          limitValue > std::numeric_limits<int32_t>::max() ||
+          iterationsValue > std::numeric_limits<int32_t>::max() ||
+          finalValue < std::numeric_limits<int32_t>::min() ||
+          finalValue > std::numeric_limits<int32_t>::max())
+        return false;
+      constantLimit = static_cast<int32_t>(limitValue);
+      constantFinalCounter = static_cast<int32_t>(finalValue);
+      constantIterationCount = static_cast<int32_t>(iterationsValue);
+    }
+
+    Value counterValue{0, Type::Int};
+    int limit = 0;
+    int iterations = 0;
+    std::string endLabel;
+    if (constantIterationCount) {
+      counterValue.reg = emitImm(*constantStart);
+      limit = emitImm(*constantLimit);
+      iterations = emitImm(*constantIterationCount);
+    } else {
+      counterValue = lowerNameValue(counter);
+      requireInt(counterValue, "while condition");
+      Value boundaryValueRuntime = lowerExpr(*condition->right);
+      requireInt(boundaryValueRuntime, "while boundary");
+      const int boundary = boundaryValueRuntime.reg;
+      limit = boundary;
+      if (condition->op == BinaryOp::Le) {
+        const int one = emitImm(1);
+        limit = emitBinaryReg(BinaryOp::Add, boundary, one);
+      } else if (condition->op == BinaryOp::Ge) {
+        const int one = emitImm(1);
+        limit = emitBinaryReg(BinaryOp::Sub, boundary, one);
+      }
+      const int conditionReg = emitBinaryReg(condition->op, counterValue.reg, boundary);
+      endLabel = newLabel("counted_loop_end");
+      IRInst skip{IROp::BranchZero};
+      skip.left = conditionReg;
+      skip.name = endLabel;
+      emit(std::move(skip));
+
+      iterations = stepValue > 0
+                       ? emitBinaryReg(BinaryOp::Sub, limit, counterValue.reg)
+                       : emitBinaryReg(BinaryOp::Sub, counterValue.reg, limit);
+      if (positiveStep != 1) {
+        const int bias = emitImm(positiveStep - 1);
+        const int biased = emitBinaryReg(BinaryOp::Add, iterations, bias);
+        const int step = emitImm(positiveStep);
+        iterations = emitBinaryReg(BinaryOp::Div, biased, step);
+      }
     }
     int counterAfterIncrement = counterValue.reg;
     if (!updates.empty()) {
@@ -2655,35 +2626,6 @@ class Lowerer {
                                       base.reg, delta);
       emitStoreName(update.target, result);
     }
-    for (const auto& conditional : conditionalUpdates) {
-      const auto& update = conditional.update;
-      Value base = lowerNameValue(update.target);
-      requireInt(base, "loop accumulator");
-      const int seriesStart = update.afterIncrement ? counterAfterIncrement : counterValue.reg;
-      Value match = lowerExpr(*conditional.matchValue);
-      requireInt(match, "loop condition");
-      const int lowerOk = stepValue > 0
-                              ? emitBinaryReg(BinaryOp::Ge, match.reg, counterValue.reg)
-                              : emitBinaryReg(BinaryOp::Le, match.reg, counterValue.reg);
-      const int upperOk = stepValue > 0
-                              ? emitBinaryReg(BinaryOp::Lt, match.reg, limit)
-                              : emitBinaryReg(BinaryOp::Gt, match.reg, limit);
-      const int inRange = emitBinaryReg(BinaryOp::Mul, lowerOk, upperOk);
-      const int point = emitLoopPointValue(*update.addend, counter, assigned,
-                                           temporaries, update.afterIncrement,
-                                           match.reg);
-      const int selectedPoint = emitBinaryReg(BinaryOp::Mul, point, inRange);
-      int delta = selectedPoint;
-      if (!conditional.includeMatch) {
-        const int fullDelta = emitLoopDelta(*update.addend, counter, assigned, temporaries,
-                                            update.afterIncrement, seriesStart,
-                                            iterations, stepValue);
-        delta = emitBinaryReg(BinaryOp::Sub, fullDelta, selectedPoint);
-      }
-      const int result = emitBinaryReg(update.sign > 0 ? BinaryOp::Add : BinaryOp::Sub,
-                                      base.reg, delta);
-      emitStoreName(update.target, result);
-    }
     int lastCounterBeforeIncrement = counterValue.reg;
     int lastCounterAfterIncrement = counterValue.reg;
     if (!directUpdates.empty()) {
@@ -2702,16 +2644,18 @@ class Lowerer {
                                            update.afterIncrement, counterAtPoint);
       emitStoreName(update.target, value);
     }
-    int finalCounter = limit;
-    if (positiveStep != 1) {
+    int finalCounter = constantFinalCounter ? emitImm(*constantFinalCounter) : limit;
+    if (!constantFinalCounter && positiveStep != 1) {
       const int step = emitImm(stepValue);
       const int distance = emitBinaryReg(BinaryOp::Mul, iterations, step);
       finalCounter = emitBinaryReg(BinaryOp::Add, counterValue.reg, distance);
     }
     emitStoreName(counter, finalCounter);
-    IRInst end{IROp::Label};
-    end.name = endLabel;
-    emit(std::move(end));
+    if (!endLabel.empty()) {
+      IRInst end{IROp::Label};
+      end.name = endLabel;
+      emit(std::move(end));
+    }
     return true;
   }
 
@@ -2866,6 +2810,7 @@ class RiscVEmitter {
     std::vector<int> valueRegisters;
     std::vector<int> valueLocalAliases;
     std::vector<int> spillSlots;
+    std::vector<unsigned char> rematerializedConstants;
     int savedRegisterCount = 0;
     int spillCount = 0;
     bool savesReturnAddress = true;
@@ -2904,6 +2849,7 @@ class RiscVEmitter {
     allocation.valueRegisters.assign(function.registerCount, -1);
     allocation.valueLocalAliases.assign(function.registerCount, -1);
     allocation.spillSlots.assign(function.registerCount, -1);
+    allocation.rematerializedConstants.assign(function.registerCount, 0);
 
     std::vector<int> localAccesses(function.localCount, 0);
     for (const auto& inst : function.code) {
@@ -3039,6 +2985,11 @@ class RiscVEmitter {
       if (localPhysical >= 0)
         allocation.valueRegisters[store.right] = localPhysical;
     }
+    for (const auto& inst : function.code) {
+      if (inst.op == IROp::Imm && inst.dst >= 0 && inst.imm != 0 &&
+          useCounts[inst.dst] == 1 && allocation.valueRegisters[inst.dst] < 0)
+        allocation.rematerializedConstants[inst.dst] = 1;
+    }
 
     std::unordered_map<std::string, int> labelPositions;
     for (size_t i = 0; i < function.code.size(); ++i) {
@@ -3076,7 +3027,8 @@ class RiscVEmitter {
 
     std::vector<int> values;
     for (int reg = 0; reg < function.registerCount; ++reg) {
-      if (first[reg] != infinity && allocation.valueLocalAliases[reg] < 0)
+      if (first[reg] != infinity && allocation.valueLocalAliases[reg] < 0 &&
+          !allocation.rematerializedConstants[reg])
         if (allocation.valueRegisters[reg] < 0) values.push_back(reg);
     }
     std::stable_sort(values.begin(), values.end(), [&](int left, int right) {
@@ -3205,9 +3157,15 @@ class RiscVEmitter {
 
   std::string valueOperand(const IRFunction& function, int reg,
                            const std::string& temporary) {
-    if (const auto constant = constantValue(function, reg);
-        constant && *constant == 0)
-      return "x0";
+    if (const auto constant = constantValue(function, reg)) {
+      if (*constant == 0) return "x0";
+      if (reg >= 0 &&
+          reg < static_cast<int>(allocation_->rematerializedConstants.size()) &&
+          allocation_->rematerializedConstants[reg]) {
+        line("  li " + temporary + ", " + std::to_string(*constant));
+        return temporary;
+      }
+    }
     const int localAlias = allocation_->valueLocalAliases[reg];
     if (localAlias >= 0) {
       const int physical = allocation_->localRegisters[localAlias];
@@ -3430,6 +3388,10 @@ class RiscVEmitter {
       switch (inst.op) {
         case IROp::Imm:
           {
+            if (inst.dst >= 0 &&
+                inst.dst < static_cast<int>(allocation.rematerializedConstants.size()) &&
+                allocation.rematerializedConstants[inst.dst])
+              break;
             const std::string dst = valueDestination(inst.dst, "t0");
             line("  li " + dst + ", " + std::to_string(inst.imm));
             finishValue(function, inst.dst, dst);
