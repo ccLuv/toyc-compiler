@@ -2970,32 +2970,48 @@ class RiscVEmitter {
     const int valueSlots = function.localCount + allocation.spillCount;
     const int outgoingBytes = std::max(0, function.maxCallArgs - 8) * 4;
     const int savedBytes = allocation.savedRegisterCount * 4;
-    const int frameSize = align16(8 + savedBytes + valueSlots * 4 + outgoingBytes);
+    bool hasStackLocal = false;
+    for (int physical : allocation.localRegisters) {
+      if (physical < 0) {
+        hasStackLocal = true;
+        break;
+      }
+    }
+    const bool needsFrame = allocation.savesReturnAddress ||
+                            allocation.savedRegisterCount > 0 ||
+                            allocation.spillCount > 0 ||
+                            outgoingBytes > 0 ||
+                            hasStackLocal ||
+                            function.params.size() > 8;
+    const int frameSize =
+        needsFrame ? align16(8 + savedBytes + valueSlots * 4 + outgoingBytes) : 0;
     const std::string epilogue = ".L" + function.name + "_return";
 
     line("");
     line("  .globl " + function.name);
     line("  .type " + function.name + ", @function");
     line(function.name + ":");
-    if (fitsImmediate12(-frameSize)) {
-      line("  addi sp, sp, -" + std::to_string(frameSize));
-      if (allocation.savesReturnAddress)
-        line("  sw ra, " + std::to_string(frameSize - 4) + "(sp)");
-      line("  sw s0, " + std::to_string(frameSize - 8) + "(sp)");
-      line("  addi s0, sp, " + std::to_string(frameSize));
-      for (int i = 0; i < allocation.savedRegisterCount; ++i)
-        line("  sw " + savedRegister(i) + ", " +
-             std::to_string(frameSize - 12 - i * 4) + "(sp)");
-    } else {
-      line("  li t0, " + std::to_string(frameSize));
-      line("  sub sp, sp, t0");
-      line("  add t6, sp, t0");
-      if (allocation.savesReturnAddress) line("  sw ra, -4(t6)");
-      line("  sw s0, -8(t6)");
-      line("  mv s0, t6");
-      for (int i = 0; i < allocation.savedRegisterCount; ++i)
-        line("  sw " + savedRegister(i) + ", " +
-             std::to_string(-12 - i * 4) + "(s0)");
+    if (needsFrame) {
+      if (fitsImmediate12(-frameSize)) {
+        line("  addi sp, sp, -" + std::to_string(frameSize));
+        if (allocation.savesReturnAddress)
+          line("  sw ra, " + std::to_string(frameSize - 4) + "(sp)");
+        line("  sw s0, " + std::to_string(frameSize - 8) + "(sp)");
+        line("  addi s0, sp, " + std::to_string(frameSize));
+        for (int i = 0; i < allocation.savedRegisterCount; ++i)
+          line("  sw " + savedRegister(i) + ", " +
+               std::to_string(frameSize - 12 - i * 4) + "(sp)");
+      } else {
+        line("  li t0, " + std::to_string(frameSize));
+        line("  sub sp, sp, t0");
+        line("  add t6, sp, t0");
+        if (allocation.savesReturnAddress) line("  sw ra, -4(t6)");
+        line("  sw s0, -8(t6)");
+        line("  mv s0, t6");
+        for (int i = 0; i < allocation.savedRegisterCount; ++i)
+          line("  sw " + savedRegister(i) + ", " +
+               std::to_string(-12 - i * 4) + "(s0)");
+      }
     }
     for (size_t i = 0; i < function.params.size(); ++i) {
       if (i < 8) {
@@ -3130,17 +3146,22 @@ class RiscVEmitter {
             const std::string value = valueOperand(function, inst.left, "t0");
             if (value != "a0") line("  mv a0, " + value);
           }
-          line("  j " + epilogue);
+          if (needsFrame)
+            line("  j " + epilogue);
+          else
+            line("  ret");
           break;
       }
     }
     line(epilogue + ":");
-    for (int i = 0; i < allocation.savedRegisterCount; ++i)
-      loadAt(savedRegister(i), "s0", -12 - i * 4);
-    if (allocation.savesReturnAddress) line("  lw ra, -4(s0)");
-    line("  lw t0, -8(s0)");
-    line("  mv sp, s0");
-    line("  mv s0, t0");
+    if (needsFrame) {
+      for (int i = 0; i < allocation.savedRegisterCount; ++i)
+        loadAt(savedRegister(i), "s0", -12 - i * 4);
+      if (allocation.savesReturnAddress) line("  lw ra, -4(s0)");
+      line("  lw t0, -8(s0)");
+      line("  mv sp, s0");
+      line("  mv s0, t0");
+    }
     line("  ret");
     line("  .size " + function.name + ", .-" + function.name);
     allocation_ = nullptr;
