@@ -2698,16 +2698,24 @@ class RiscVEmitter {
     }
     for (int physical = 0; physical < savedPhysicalCount(); ++physical)
       localPool.push_back(physical);
-    const int valueReserve = hasCall ? 4 : 5;
-    const int localRegisterCount = std::min(
-        function.localCount,
+    int hotLocalCount = 0;
+    for (int accesses : localAccesses)
+      if (accesses >= 3) ++hotLocalCount;
+    int valueReserve = hasCall ? 5 : 6;
+    if (function.registerCount > 90) valueReserve += 2;
+    if (function.registerCount > 180) valueReserve += 2;
+    const int extraLocalRegisterCount = std::min(
+        hotLocalCount,
         std::max(0, static_cast<int>(localPool.size()) - valueReserve));
     int assignedLocals = 0;
     for (int physical : allocation.localRegisters)
       if (physical >= 0) ++assignedLocals;
+    const int localRegisterTarget =
+        std::min(function.localCount, assignedLocals + extraLocalRegisterCount);
     for (int local : locals) {
-      if (assignedLocals >= localRegisterCount) break;
+      if (assignedLocals >= localRegisterTarget) break;
       if (allocation.localRegisters[local] >= 0) continue;
+      if (localAccesses[local] < 3) continue;
       int physical = -1;
       while (!localPool.empty()) {
         physical = localPool.front();
@@ -2961,6 +2969,9 @@ class RiscVEmitter {
 
   std::string valueOperand(const IRFunction& function, int reg,
                            const std::string& temporary) {
+    if (const auto constant = constantValue(function, reg);
+        constant && *constant == 0)
+      return "x0";
     const int localAlias = allocation_->valueLocalAliases[reg];
     if (localAlias >= 0) {
       const int physical = allocation_->localRegisters[localAlias];
