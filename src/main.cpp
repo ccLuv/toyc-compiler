@@ -3054,11 +3054,13 @@ class RiscVEmitter {
  private:
   struct Allocation {
     std::vector<int> localRegisters;
+    std::vector<int> localStackSlots;
     std::vector<int> valueRegisters;
     std::vector<int> valueLocalAliases;
     std::vector<int> spillSlots;
     std::vector<unsigned char> rematerializedConstants;
     int savedRegisterCount = 0;
+    int localStackCount = 0;
     int spillCount = 0;
     bool savesReturnAddress = true;
   };
@@ -3093,6 +3095,7 @@ class RiscVEmitter {
   Allocation allocateRegisters(const IRFunction& function) const {
     Allocation allocation;
     allocation.localRegisters.assign(function.localCount, -1);
+    allocation.localStackSlots.assign(function.localCount, -1);
     allocation.valueRegisters.assign(function.registerCount, -1);
     allocation.valueLocalAliases.assign(function.registerCount, -1);
     allocation.spillSlots.assign(function.registerCount, -1);
@@ -3350,6 +3353,10 @@ class RiscVEmitter {
       if (physical >= 0 && physical < savedPhysicalCount())
         allocation.savedRegisterCount = std::max(allocation.savedRegisterCount, physical + 1);
     }
+    for (int local = 0; local < function.localCount; ++local) {
+      if (allocation.localRegisters[local] < 0)
+        allocation.localStackSlots[local] = allocation.localStackCount++;
+    }
     return allocation;
   }
 
@@ -3377,6 +3384,7 @@ class RiscVEmitter {
     }
   }
   void loadReg(const IRFunction& function, int reg, const std::string& dst) {
+    (void)function;
     const int localAlias = allocation_->valueLocalAliases[reg];
     if (localAlias >= 0) {
       loadLocal(localAlias, dst);
@@ -3388,18 +3396,17 @@ class RiscVEmitter {
       if (source != dst) line("  mv " + dst + ", " + source);
       return;
     }
-    const int slot = function.localCount + allocation_->spillSlots[reg];
-    loadAt(dst, "s0", slotOffset(slot));
+    loadAt(dst, "s0", slotOffset(allocation_->localStackCount + allocation_->spillSlots[reg]));
   }
   void storeReg(const IRFunction& function, int reg, const std::string& src) {
+    (void)function;
     const int physical = allocation_->valueRegisters[reg];
     if (physical >= 0) {
       const std::string destination = physicalRegister(physical);
       if (destination != src) line("  mv " + destination + ", " + src);
       return;
     }
-    const int slot = function.localCount + allocation_->spillSlots[reg];
-    storeAt(src, "s0", slotOffset(slot));
+    storeAt(src, "s0", slotOffset(allocation_->localStackCount + allocation_->spillSlots[reg]));
   }
 
   std::string valueOperand(const IRFunction& function, int reg,
@@ -3417,13 +3424,12 @@ class RiscVEmitter {
     if (localAlias >= 0) {
       const int physical = allocation_->localRegisters[localAlias];
       if (physical >= 0) return physicalRegister(physical);
-      loadAt(temporary, "s0", slotOffset(localAlias));
+      loadAt(temporary, "s0", slotOffset(allocation_->localStackSlots[localAlias]));
       return temporary;
     }
     const int physical = allocation_->valueRegisters[reg];
     if (physical >= 0) return physicalRegister(physical);
-    const int slot = function.localCount + allocation_->spillSlots[reg];
-    loadAt(temporary, "s0", slotOffset(slot));
+    loadAt(temporary, "s0", slotOffset(allocation_->localStackCount + allocation_->spillSlots[reg]));
     return temporary;
   }
 
@@ -3434,9 +3440,9 @@ class RiscVEmitter {
 
   void finishValue(const IRFunction& function, int reg,
                    const std::string& producedIn) {
+    (void)function;
     if (allocation_->valueRegisters[reg] >= 0) return;
-    const int slot = function.localCount + allocation_->spillSlots[reg];
-    storeAt(producedIn, "s0", slotOffset(slot));
+    storeAt(producedIn, "s0", slotOffset(allocation_->localStackCount + allocation_->spillSlots[reg]));
   }
   void loadLocal(int slot, const std::string& dst) {
     const int physical = allocation_->localRegisters[slot];
@@ -3445,7 +3451,7 @@ class RiscVEmitter {
       if (source != dst) line("  mv " + dst + ", " + source);
       return;
     }
-    loadAt(dst, "s0", slotOffset(slot));
+    loadAt(dst, "s0", slotOffset(allocation_->localStackSlots[slot]));
   }
   void storeLocal(int slot, const std::string& src) {
     const int physical = allocation_->localRegisters[slot];
@@ -3454,7 +3460,7 @@ class RiscVEmitter {
       if (destination != src) line("  mv " + destination + ", " + src);
       return;
     }
-    storeAt(src, "s0", slotOffset(slot));
+    storeAt(src, "s0", slotOffset(allocation_->localStackSlots[slot]));
   }
 
   static std::optional<int32_t> constantValue(const IRFunction& function, int reg) {
@@ -3534,35 +3540,43 @@ class RiscVEmitter {
   void emitFunction(const IRFunction& function) {
     const Allocation allocation = allocateRegisters(function);
     allocation_ = &allocation;
-    const int valueSlots = function.localCount + allocation.spillCount;
+    const int valueSlots = allocation.localStackCount + allocation.spillCount;
     const int outgoingBytes = std::max(0, function.maxCallArgs - 8) * 4;
     const int savedBytes = allocation.savedRegisterCount * 4;
-    const int frameSize = align16(8 + savedBytes + valueSlots * 4 + outgoingBytes);
+    const bool usesFrame = allocation.savesReturnAddress ||
+                           allocation.savedRegisterCount > 0 ||
+                           valueSlots > 0 ||
+                           outgoingBytes > 0 ||
+                           function.params.size() > 8;
+    const int frameSize =
+        usesFrame ? align16(8 + savedBytes + valueSlots * 4 + outgoingBytes) : 0;
     const std::string epilogue = ".L" + function.name + "_return";
 
     line("");
     line("  .globl " + function.name);
     line("  .type " + function.name + ", @function");
     line(function.name + ":");
-    if (fitsImmediate12(-frameSize)) {
-      line("  addi sp, sp, -" + std::to_string(frameSize));
-      if (allocation.savesReturnAddress)
-        line("  sw ra, " + std::to_string(frameSize - 4) + "(sp)");
-      line("  sw s0, " + std::to_string(frameSize - 8) + "(sp)");
-      line("  addi s0, sp, " + std::to_string(frameSize));
-      for (int i = 0; i < allocation.savedRegisterCount; ++i)
-        line("  sw " + savedRegister(i) + ", " +
-             std::to_string(frameSize - 12 - i * 4) + "(sp)");
-    } else {
-      line("  li t0, " + std::to_string(frameSize));
-      line("  sub sp, sp, t0");
-      line("  add t6, sp, t0");
-      if (allocation.savesReturnAddress) line("  sw ra, -4(t6)");
-      line("  sw s0, -8(t6)");
-      line("  mv s0, t6");
-      for (int i = 0; i < allocation.savedRegisterCount; ++i)
-        line("  sw " + savedRegister(i) + ", " +
-             std::to_string(-12 - i * 4) + "(s0)");
+    if (usesFrame) {
+      if (fitsImmediate12(-frameSize)) {
+        line("  addi sp, sp, -" + std::to_string(frameSize));
+        if (allocation.savesReturnAddress)
+          line("  sw ra, " + std::to_string(frameSize - 4) + "(sp)");
+        line("  sw s0, " + std::to_string(frameSize - 8) + "(sp)");
+        line("  addi s0, sp, " + std::to_string(frameSize));
+        for (int i = 0; i < allocation.savedRegisterCount; ++i)
+          line("  sw " + savedRegister(i) + ", " +
+               std::to_string(frameSize - 12 - i * 4) + "(sp)");
+      } else {
+        line("  li t0, " + std::to_string(frameSize));
+        line("  sub sp, sp, t0");
+        line("  add t6, sp, t0");
+        if (allocation.savesReturnAddress) line("  sw ra, -4(t6)");
+        line("  sw s0, -8(t6)");
+        line("  mv s0, t6");
+        for (int i = 0; i < allocation.savedRegisterCount; ++i)
+          line("  sw " + savedRegister(i) + ", " +
+               std::to_string(-12 - i * 4) + "(s0)");
+      }
     }
     for (size_t i = 0; i < function.params.size(); ++i) {
       if (i < 8) {
@@ -3648,7 +3662,18 @@ class RiscVEmitter {
           // The virtual value aliases the local's storage until its only use.
           break;
         case IROp::StoreLocal:
-          storeLocal(inst.left, valueOperand(function, inst.right, "t0"));
+          if (const auto constant = constantValue(function, inst.right);
+              constant && inst.left >= 0 &&
+              allocation.localRegisters[inst.left] >= 0) {
+            const std::string destination =
+                physicalRegister(allocation.localRegisters[inst.left]);
+            if (*constant == 0)
+              line("  mv " + destination + ", x0");
+            else
+              line("  li " + destination + ", " + std::to_string(*constant));
+          } else {
+            storeLocal(inst.left, valueOperand(function, inst.right, "t0"));
+          }
           break;
         case IROp::LoadGlobal:
           {
@@ -3698,8 +3723,15 @@ class RiscVEmitter {
           break;
         case IROp::Return:
           if (inst.left >= 0) {
-            const std::string value = valueOperand(function, inst.left, "t0");
-            if (value != "a0") line("  mv a0, " + value);
+            if (const auto constant = constantValue(function, inst.left)) {
+              if (*constant == 0)
+                line("  mv a0, x0");
+              else
+                line("  li a0, " + std::to_string(*constant));
+            } else {
+              const std::string value = valueOperand(function, inst.left, "t0");
+              if (value != "a0") line("  mv a0, " + value);
+            }
           }
           if (pc + 1 < function.code.size())
             line("  j " + epilogue);
@@ -3707,12 +3739,14 @@ class RiscVEmitter {
       }
     }
     line(epilogue + ":");
-    for (int i = 0; i < allocation.savedRegisterCount; ++i)
-      loadAt(savedRegister(i), "s0", -12 - i * 4);
-    if (allocation.savesReturnAddress) line("  lw ra, -4(s0)");
-    line("  lw t0, -8(s0)");
-    line("  mv sp, s0");
-    line("  mv s0, t0");
+    if (usesFrame) {
+      for (int i = 0; i < allocation.savedRegisterCount; ++i)
+        loadAt(savedRegister(i), "s0", -12 - i * 4);
+      if (allocation.savesReturnAddress) line("  lw ra, -4(s0)");
+      line("  lw t0, -8(s0)");
+      line("  mv sp, s0");
+      line("  mv s0, t0");
+    }
     line("  ret");
     line("  .size " + function.name + ", .-" + function.name);
     allocation_ = nullptr;
