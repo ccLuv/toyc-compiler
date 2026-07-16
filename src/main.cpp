@@ -2295,16 +2295,11 @@ class RiscVEmitter {
         break;
       }
     }
-    const int callerSavedPhysicalStart = savedPhysicalCount();
-    const int callerSavedPhysicalCount = hasCall ? 0 : 3;
-    const int physicalCount = savedPhysicalCount() + callerSavedPhysicalCount;
+    const int physicalCount = savedPhysicalCount() + (hasCall ? 0 : 3);
     allocation.savesReturnAddress = hasCall;
     const int localRegisterCount = std::min(function.localCount, std::max(0, physicalCount - 2));
-    int assignedLocalRegisters = 0;
-    for (int i = 0; i < callerSavedPhysicalCount && assignedLocalRegisters < localRegisterCount; ++i)
-      allocation.localRegisters[locals[assignedLocalRegisters++]] = callerSavedPhysicalStart + i;
-    for (int i = 0; assignedLocalRegisters < localRegisterCount; ++i)
-      allocation.localRegisters[locals[assignedLocalRegisters++]] = i;
+    for (int i = 0; i < localRegisterCount; ++i)
+      allocation.localRegisters[locals[i]] = i;
 
     const int infinity = std::numeric_limits<int>::max();
     std::vector<int> first(function.registerCount, infinity);
