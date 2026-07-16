@@ -2562,12 +2562,19 @@ class RiscVEmitter {
     }
     const int physicalCount = savedPhysicalCount() + 3;
     allocation.savesReturnAddress = hasCall;
-    const int valueReserve = hasCall ? 4 : 6;
-    const int localPhysicalLimit = hasCall ? savedPhysicalCount() : physicalCount;
-    const int localRegisterCount =
-        std::min(function.localCount, std::max(0, localPhysicalLimit - valueReserve));
+    std::vector<int> localPool;
+    if (!hasCall) {
+      for (int physical = savedPhysicalCount(); physical < physicalCount; ++physical)
+        localPool.push_back(physical);
+    }
+    for (int physical = 0; physical < savedPhysicalCount(); ++physical)
+      localPool.push_back(physical);
+    const int valueReserve = hasCall ? 4 : 5;
+    const int localRegisterCount = std::min(
+        function.localCount,
+        std::max(0, static_cast<int>(localPool.size()) - valueReserve));
     for (int i = 0; i < localRegisterCount; ++i)
-      allocation.localRegisters[locals[i]] = i;
+      allocation.localRegisters[locals[i]] = localPool[i];
 
     const int infinity = std::numeric_limits<int>::max();
     std::vector<int> first(function.registerCount, infinity);
@@ -2684,7 +2691,8 @@ class RiscVEmitter {
     struct Active { int value; int physical; };
     std::vector<Active> active;
     std::vector<bool> used(physicalCount, false);
-    for (int i = 0; i < localRegisterCount; ++i) used[i] = true;
+    for (int physical : allocation.localRegisters)
+      if (physical >= 0) used[physical] = true;
     for (int value : values) {
       for (auto it = active.begin(); it != active.end();) {
         if (last[it->value] < first[value]) {
@@ -2695,8 +2703,16 @@ class RiscVEmitter {
         }
       }
       int physical = -1;
-      for (int candidate = localRegisterCount; candidate < physicalCount; ++candidate) {
-        if (crossesCall(value) && candidate >= savedPhysicalCount()) continue;
+      std::vector<int> candidates;
+      const bool crosses = crossesCall(value);
+      if (!crosses) {
+        for (int candidate = savedPhysicalCount(); candidate < physicalCount; ++candidate)
+          candidates.push_back(candidate);
+      }
+      for (int candidate = 0; candidate < savedPhysicalCount(); ++candidate)
+        candidates.push_back(candidate);
+      for (int candidate : candidates) {
+        if (crosses && candidate >= savedPhysicalCount()) continue;
         if (!used[candidate]) {
           physical = candidate;
           break;
@@ -2707,7 +2723,25 @@ class RiscVEmitter {
         used[physical] = true;
         active.push_back({value, physical});
       } else {
-        allocation.spillSlots[value] = allocation.spillCount++;
+        int spillIndex = -1;
+        int farthestEnd = last[value];
+        for (size_t i = 0; i < active.size(); ++i) {
+          if (crosses && active[i].physical >= savedPhysicalCount()) continue;
+          const int activeEnd = last[active[i].value];
+          if (activeEnd > farthestEnd) {
+            farthestEnd = activeEnd;
+            spillIndex = static_cast<int>(i);
+          }
+        }
+        if (spillIndex >= 0) {
+          Active spilled = active[spillIndex];
+          allocation.valueRegisters[spilled.value] = -1;
+          allocation.spillSlots[spilled.value] = allocation.spillCount++;
+          allocation.valueRegisters[value] = spilled.physical;
+          active[spillIndex] = {value, spilled.physical};
+        } else {
+          allocation.spillSlots[value] = allocation.spillCount++;
+        }
       }
     }
     allocation.savedRegisterCount = 0;
