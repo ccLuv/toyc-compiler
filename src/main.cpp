@@ -2905,11 +2905,29 @@ class RiscVEmitter {
     allocation.valueLocalAliases.assign(function.registerCount, -1);
     allocation.spillSlots.assign(function.registerCount, -1);
 
+    std::vector<int> loopWeights(function.code.size(), 1);
+    std::unordered_map<std::string, int> localLabelPositions;
+    for (size_t i = 0; i < function.code.size(); ++i) {
+      if (function.code[i].op == IROp::Label)
+        localLabelPositions[function.code[i].name] = static_cast<int>(i);
+    }
+    for (size_t i = 0; i < function.code.size(); ++i) {
+      const auto& inst = function.code[i];
+      if (inst.op != IROp::Jump && inst.op != IROp::BranchZero) continue;
+      const auto target = localLabelPositions.find(inst.name);
+      if (target == localLabelPositions.end() ||
+          target->second >= static_cast<int>(i))
+        continue;
+      for (int j = target->second; j <= static_cast<int>(i); ++j)
+        loopWeights[j] += 8;
+    }
+
     std::vector<int> localAccesses(function.localCount, 0);
-    for (const auto& inst : function.code) {
+    for (size_t i = 0; i < function.code.size(); ++i) {
+      const auto& inst = function.code[i];
       if ((inst.op == IROp::LoadLocal || inst.op == IROp::StoreLocal) &&
           inst.left >= 0) {
-        ++localAccesses[inst.left];
+        localAccesses[inst.left] += loopWeights[i];
       }
       if (inst.op == IROp::LoadLocal && inst.dst >= 0)
         allocation.valueLocalAliases[inst.dst] = inst.left;
@@ -2952,6 +2970,7 @@ class RiscVEmitter {
     for (int local : locals) {
       if (assignedLocals >= localRegisterCount) break;
       if (allocation.localRegisters[local] >= 0) continue;
+      if (localAccesses[local] == 0) continue;
       int physical = -1;
       while (!localPool.empty()) {
         physical = localPool.front();
